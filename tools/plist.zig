@@ -80,7 +80,7 @@ pub fn orientations(o: settings_mod.Orientation) []const []const u8 {
     return switch (o) {
         .portrait => &.{"UIInterfaceOrientationPortrait"},
         .landscape, .sensor_landscape => &.{ "UIInterfaceOrientationLandscapeLeft", "UIInterfaceOrientationLandscapeRight" },
-        .all => &.{ "UIInterfaceOrientationPortrait", "UIInterfaceOrientationLandscapeLeft", "UIInterfaceOrientationLandscapeRight" },
+        .all => &.{ "UIInterfaceOrientationPortrait", "UIInterfaceOrientationPortraitUpsideDown", "UIInterfaceOrientationLandscapeLeft", "UIInterfaceOrientationLandscapeRight" },
     };
 }
 
@@ -172,6 +172,15 @@ test "every orientation maps to its UISupportedInterfaceOrientations array" {
         try std.testing.expectEqual(@as(usize, if (case[1]) 2 else 0), std.mem.count(u8, plist, portrait));
         try std.testing.expectEqual(@as(usize, if (case[2]) 2 else 0), std.mem.count(u8, plist, left));
         try std.testing.expectEqual(@as(usize, if (case[2]) 2 else 0), std.mem.count(u8, plist, right));
+    }
+    // Only `all` allows upside-down portrait, on iPhone and iPad alike.
+    const upside_down = "<string>UIInterfaceOrientationPortraitUpsideDown</string>";
+    inline for (.{ .{ settings_mod.Orientation.all, 2 }, .{ settings_mod.Orientation.portrait, 0 }, .{ settings_mod.Orientation.landscape, 0 } }) |case| {
+        var o = base;
+        o.orientation = case[0];
+        const p = try infoPlist(a, o);
+        defer a.free(p);
+        try std.testing.expectEqual(@as(usize, case[1]), std.mem.count(u8, p, upside_down));
     }
     // `sensor_landscape` and `landscape` are the same plist on iOS.
     var l = base;

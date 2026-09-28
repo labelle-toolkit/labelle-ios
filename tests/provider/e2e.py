@@ -243,14 +243,14 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
     assert (app / 'PkgInfo').read_text() == 'APPL????'
     record = json.loads((ios_dir / 'app.json').read_text())
     assert record['app'] == 'Fixture_Game.app' and record['executable'] == 'game', record
-    assert not list(ios_dir.glob('.staging-*')), list(ios_dir.iterdir())
+    assert not list((target / 'zig-out').glob('.ios-staging-*')), list((target / 'zig-out').iterdir())
     if macos:
         # Ad-hoc signed with the codesign on PATH, as Xcode signs simulator
         # builds, while still staged.
         assert len(calls('codesign')) == 1, calls('codesign')
         signed = calls('codesign')[0]['argv']
         assert signed[:4] == ['--force', '--sign', '-', '--timestamp=none'], signed
-        assert Path(signed[4]).name == 'Fixture_Game.app' and Path(signed[4]).parent.name.startswith('.staging-'), signed
+        assert Path(signed[4]).name == 'Fixture_Game.app' and Path(signed[4]).parent.name.startswith('.ios-staging-'), signed
         assert record['signed'] is True, record
     else:
         assert calls('codesign') == [] and record['signed'] is False, (calls('codesign'), record)

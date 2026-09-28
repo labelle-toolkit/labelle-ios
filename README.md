@@ -71,9 +71,13 @@ zig-out/bundle/ios/<AppName>-simulator.zip   `bundle` hook
 `<AppName>` is `app_name` (else the project `.title`, which must then pass the
 same rule as `app_name`) with anything but letters, digits, `-` and `_`
 replaced by `_`. A failed `app` hook leaves no `.app`: the previous one is
-removed first and the new one is staged. An unreadable `assets/` fails the
-hook; only an absent one is skipped. The `launch` hook refuses an app whose
-executable, settings file, app name or icon changed since it was made.
+removed first; the new app and its `app.json` are staged together and moved
+into `zig-out/ios/` in one rename. An unreadable `assets/` fails the hook;
+only an absent one is skipped. A symbolic link in `assets/` ships its
+target's contents when it resolves inside the project; a link that dangles
+or leaves the project is refused. The `launch` hook refuses an app whose
+executable, settings file, app name, icon or assets changed since it was
+made.
 
 ### Running
 
@@ -120,10 +124,10 @@ labelle run --platform=ios --timeout=30s            # stop the app after 30 s
 |---|---|---|---|
 | `schema_version` | yes | | `1` |
 | `bundle_id` | yes | | reverse-DNS: at least two `.`-separated segments of letters, digits and `-`, the first starting with a letter |
-| `app_name` | no | project `.title` | non-empty, no control characters; the home-screen name |
+| `app_name` | no | project `.title` | non-empty, no control characters, not a Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9, any case or extension); the home-screen name. A `.title` used in its place must pass the same rules |
 | `team_id` | no | | 10 characters, `A-Z0-9`. Validated now, used by device signing in v0.2 |
 | `minimum_ios` | no | `"15.0"` | `N.N` or `N.N.N`, at least 14.0 (the storyboard-free launch screen) |
-| `orientation` | no | `"all"` | `portrait`, `landscape`, `sensor_landscape` (same as `landscape` on iOS), `all` |
+| `orientation` | no | `"all"` | `portrait`, `landscape`, `sensor_landscape` (same as `landscape` on iOS), `all` (includes upside-down portrait) |
 | `device_family` | no | `"1,2"` | `"1"` iPhone, `"2"` iPad, `"1,2"` both |
 | `simulator.device` | no | `null` | a simulator UDID or device name; `null` picks one |
 | `destination` | no | `"simulator"` | `"simulator"`. `"device"` is refused: device builds arrive in v0.2 |

@@ -101,6 +101,8 @@ pub fn validate(a: std.mem.Allocator, s: Settings, diag: *Diagnostic) Error!void
         return fail(a, diag, "bundle_id '{s}' is not a valid bundle identifier (reverse-DNS: letters, digits, '-' and '.', e.g. com.studio.game)", .{s.bundle_id});
     if (s.app_name) |name| {
         if (!displayText(name)) return fail(a, diag, "app_name must be non-empty text without control characters", .{});
+        if (windowsReservedName(name))
+            return fail(a, diag, "app_name '{s}' is a reserved device name on Windows (CON, PRN, AUX, NUL, COM1-9, LPT1-9), so the .app could not be copied there", .{name});
     }
     if (s.team_id) |team| {
         if (!teamId(team)) return fail(a, diag, "team_id '{s}' must be a 10-character Apple Team ID (A-Z, 0-9)", .{team});
@@ -159,6 +161,21 @@ pub fn teamId(value: []const u8) bool {
         if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c))) return false;
     }
     return true;
+}
+
+/// A name Windows reserves for a device in every directory, whatever the
+/// case and extension (`con`, `Con.txt`, `LPT1 `): CON, PRN, AUX, NUL,
+/// COM1-COM9, LPT1-LPT9. The app name names the `.app` directory, which must
+/// stay copyable to a Windows machine.
+pub fn windowsReservedName(name: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
+    // Windows also ignores trailing spaces and dots of the stem.
+    const stem = std.mem.trimEnd(u8, name[0..dot], " .");
+    for ([_][]const u8{ "con", "prn", "aux", "nul" }) |device| {
+        if (std.ascii.eqlIgnoreCase(stem, device)) return true;
+    }
+    return stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "com") or std.ascii.eqlIgnoreCase(stem[0..3], "lpt")) and
+        stem[3] >= '1' and stem[3] <= '9';
 }
 
 /// `N.N[.N]` as three numbers, or null when malformed.
@@ -310,6 +327,23 @@ test "every rejection names its reason" {
 test "bundleId follows the CFBundleIdentifier rule" {
     for ([_][]const u8{ "com.a", "com.labelle.flying-platform", "io.Studio.Game2", "a.b.c.d", "com.1up" }) |ok| try std.testing.expect(bundleId(ok));
     for ([_][]const u8{ "", "com", "com.", ".com", "com..a", "com.a_b", "com.a b", "1.a", "-a.b", "com.a/b" }) |bad| try std.testing.expect(!bundleId(bad));
+}
+
+test "windowsReservedName: device names in any case, with or without an extension" {
+    for ([_][]const u8{ "CON", "con", "Con.app", "prn", "AUX.txt", "nul", "NUL.tar.gz", "COM1", "com9", "LPT1", "lpt9.x", "CON ", "Aux ." }) |bad| {
+        try std.testing.expect(windowsReservedName(bad));
+    }
+    for ([_][]const u8{ "Console", "COM", "COM0", "COM10", "LPT", "auxiliary", "my con", "nul-game", "Flying Platform" }) |ok| {
+        try std.testing.expect(!windowsReservedName(ok));
+    }
+}
+
+test "an app_name Windows reserves is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidSettings, parse(arena.allocator(), "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"app_name\": \"Com1\"}", &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.message, "reserved device name on Windows") != null);
 }
 
 test "osTriple" {

@@ -13,8 +13,10 @@
 //!       assets/                    `<target_dir>/assets`, when present
 //!   zig-out/ios/app.json           what the `.app` was made from (`Record`)
 //!
-//! The previous `zig-out/ios/` is removed first and the bundle is staged and
-//! renamed into place, so a failure leaves no `.app`: an older one is never
+//! The previous `zig-out/ios/` is removed first. The bundle AND its record
+//! are staged in `zig-out/.ios-staging-<pid>/` and that directory is renamed
+//! to `zig-out/ios/` in one step, so the app and its record appear together
+//! or not at all: a failure leaves no `.app`, and an older one is never
 //! presented as this build's.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,6 +24,7 @@ const settings_mod = @import("settings.zig");
 const identity_mod = @import("project_identity.zig");
 const plist = @import("plist.zig");
 const proc = @import("proc.zig");
+const assets_mod = @import("assets.zig");
 
 pub const Inputs = struct {
     project_dir: []const u8,
@@ -39,6 +42,8 @@ pub const Inputs = struct {
     /// Ad-hoc sign the bundle: on a macOS host, the only one with
     /// `codesign` and the only one that can run the simulator.
     sign: bool = builtin.os.tag == .macos,
+    /// Test seam: make writing `app.json` fail, as a full disk would.
+    fail_record_write: bool = false,
 };
 
 pub const record_name = "app.json";
@@ -81,10 +86,14 @@ pub fn bundleVersion(build_number: ?[]const u8) !u32 {
 /// has to pass the same rule an explicit `app_name` does (it is written into
 /// Info.plist and names the bundle).
 pub fn resolvedAppName(in: Inputs) ![]const u8 {
-    if (in.settings.app_name) |name| return name;
+    if (in.settings.app_name) |name| return name; // validated with the settings
     const title = in.identity.title;
     if (!settings_mod.displayText(title)) {
         std.debug.print("labelle-ios: the project .title is not usable as the app name (empty, or it has control characters): set \"app_name\" in providers/ios.json\n", .{});
+        return error.InvalidAppName;
+    }
+    if (settings_mod.windowsReservedName(title)) {
+        std.debug.print("labelle-ios: the project .title '{s}' is a reserved device name on Windows, so the .app could not be copied there: set \"app_name\" in providers/ios.json\n", .{title});
         return error.InvalidAppName;
     }
     return title;
@@ -118,9 +127,49 @@ pub fn inputsDigest(a: std.mem.Allocator, io: std.Io, in: Inputs) ![]const u8 {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 * 1024 * 1024)) catch |err| @errorName(err);
         part(&h, "icon", bytes);
     }
+    // Every shipped asset by path, size and content, through the same walk
+    // the copy uses.
+    const Digest = struct {
+        a: std.mem.Allocator,
+        io: std.Io,
+        h: *std.crypto.hash.sha2.Sha256,
+        add: *const fn (*std.crypto.hash.sha2.Sha256, []const u8, []const u8) void,
+
+        pub fn dir(d: *@This(), rel: []const u8) !void {
+            d.add(d.h, "asset_dir", rel);
+        }
+
+        pub fn file(d: *@This(), rel: []const u8, path: []const u8) !void {
+            const stat = try std.Io.Dir.cwd().statFile(d.io, path, .{});
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, stat.size, .little);
+            d.add(d.h, "asset", rel);
+            d.add(d.h, "asset_size", &size);
+            d.add(d.h, "asset_sha256", try fileSha256(d.a, d.io, path));
+        }
+    };
+    var visitor: Digest = .{ .a = a, .io = io, .h = &h, .add = part };
+    try walkAssets(a, io, in, &visitor);
     var digest: [32]u8 = undefined;
     h.final(&digest);
     return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
+
+/// Walk `<target_dir>/assets` with `visitor` (`assets.zig`); absent is no
+/// assets, any other error stops the hook with its reason.
+fn walkAssets(a: std.mem.Allocator, io: std.Io, in: Inputs, visitor: anytype) !void {
+    const assets = try std.fs.path.join(a, &.{ in.target_dir, "assets" });
+    std.Io.Dir.cwd().access(io, assets, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            std.debug.print("labelle-ios: cannot read {s}: {s}\n", .{ assets, @errorName(err) });
+            return err;
+        },
+    };
+    assets_mod.walk(a, io, in.project_dir, assets, visitor) catch |err| {
+        std.debug.print("labelle-ios: cannot read {s}: {s}\n", .{ assets, @errorName(err) });
+        return err;
+    };
 }
 
 /// The hex SHA-256 of the file at `path`, read through a fixed buffer.
@@ -211,7 +260,7 @@ fn stagingName(a: std.mem.Allocator) ![]const u8 {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.c.getpid()),
     };
-    return std.fmt.allocPrint(a, ".staging-{d}", .{pid});
+    return std.fmt.allocPrint(a, ".ios-staging-{d}", .{pid});
 }
 
 /// Build `zig-out/ios/<AppName>.app` and its record.
@@ -226,7 +275,9 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
     const app_name = try resolvedAppName(in);
     const inputs_sha256 = try inputsDigest(a, io, in);
     const bundle_name = try bundleDirName(a, app_name);
-    const staging_root = try std.fs.path.join(a, &.{ ios_dir, try stagingName(a) });
+    // Beside `zig-out/ios/`, renamed onto it once complete.
+    const staging_root = try std.fs.path.join(a, &.{ in.target_dir, "zig-out", try stagingName(a) });
+    try cwd.deleteTree(io, staging_root);
     defer cwd.deleteTree(io, staging_root) catch {};
     const staged = try std.fs.path.join(a, &.{ staging_root, bundle_name });
     try cwd.createDirPath(io, staged);
@@ -270,30 +321,33 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
     try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ staged, "Info.plist" }), .data = info });
     try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ staged, "PkgInfo" }), .data = "APPL????" });
 
-    const assets = try std.fs.path.join(a, &.{ in.target_dir, "assets" });
     // Absent is fine (not every project has assets); anything else that
     // stops us reading them fails the hook rather than ship an app without
     // them.
-    if (cwd.access(io, assets, .{})) |_| {
-        copyTree(a, io, assets, try std.fs.path.join(a, &.{ staged, "assets" })) catch |err| {
-            std.debug.print("labelle-ios: cannot copy {s} into the app: {s}\n", .{ assets, @errorName(err) });
-            return err;
-        };
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => {
-            std.debug.print("labelle-ios: cannot read {s}: {s}\n", .{ assets, @errorName(err) });
-            return err;
-        },
-    }
+    const Copy = struct {
+        io: std.Io,
+        a: std.mem.Allocator,
+        dst: []const u8,
+
+        pub fn dir(c: *@This(), rel: []const u8) !void {
+            try std.Io.Dir.cwd().createDirPath(c.io, try std.fs.path.join(c.a, &.{ c.dst, rel }));
+        }
+
+        pub fn file(c: *@This(), rel: []const u8, path: []const u8) !void {
+            const cwd_ = std.Io.Dir.cwd();
+            const to = try std.fs.path.join(c.a, &.{ c.dst, rel });
+            try cwd_.createDirPath(c.io, std.fs.path.dirname(to).?);
+            try cwd_.copyFile(path, cwd_, to, c.io, .{});
+        }
+    };
+    var copier: Copy = .{ .io = io, .a = a, .dst = try std.fs.path.join(a, &.{ staged, "assets" }) };
+    try walkAssets(a, io, in, &copier);
 
     const signed = if (in.sign) try adHocSign(a, io, in.env, staged) else blk: {
         std.debug.print("labelle-ios: note: {s} is not signed: codesign needs a macOS host\n", .{bundle_name});
         break :blk false;
     };
 
-    const final = try std.fs.path.join(a, &.{ ios_dir, bundle_name });
-    try cwd.rename(staged, cwd, final, io);
     const record: Record = .{
         .app = bundle_name,
         .bundle_id = in.settings.bundle_id,
@@ -304,11 +358,15 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
         .signed = signed,
     };
     const json = try std.json.Stringify.valueAlloc(a, record, .{ .whitespace = .indent_2 });
+    // The record is staged next to the app (outside it: the signature seals
+    // the bundle), then both become `zig-out/ios/` in one rename.
+    if (in.fail_record_write) return error.NoSpaceLeft;
     try cwd.writeFile(io, .{
-        .sub_path = try std.fs.path.join(a, &.{ ios_dir, record_name }),
+        .sub_path = try std.fs.path.join(a, &.{ staging_root, record_name }),
         .data = try std.fmt.allocPrint(a, "{s}\n", .{json}),
     });
-    return .{ .path = final, .record = record };
+    try cwd.rename(staging_root, cwd, ios_dir, io);
+    return .{ .path = try std.fs.path.join(a, &.{ ios_dir, bundle_name }), .record = record };
 }
 
 pub fn isPng(bytes: []const u8) bool {
@@ -334,28 +392,9 @@ fn adHocSign(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.M
     return true;
 }
 
-/// Copy the directory tree `src` to `dst` (created), regular files and
-/// directories only.
-fn copyTree(a: std.mem.Allocator, io: std.Io, src: []const u8, dst: []const u8) !void {
-    const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, dst);
-    var dir = try cwd.openDir(io, src, .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(a);
-    defer walker.deinit();
-    while (try walker.next(io)) |e| {
-        const to = try std.fs.path.join(a, &.{ dst, e.path });
-        switch (e.kind) {
-            .directory => try cwd.createDirPath(io, to),
-            .file => try cwd.copyFile(try std.fs.path.join(a, &.{ src, e.path }), cwd, to, io, .{}),
-            else => {},
-        }
-    }
-}
-
 /// Read `zig-out/ios/app.json` and check that the app is still what this
 /// build and these inputs would make: the same executable (by content) and
-/// the same `inputsDigest` (settings, app name, icon). Returns the app.
+/// the same `inputsDigest` (settings, app name, icon, assets). Returns the app.
 pub fn built(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
     const ios_dir = try iosDir(a, in.target_dir);
     const raw = std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ ios_dir, record_name }), a, .limited(64 * 1024)) catch {
@@ -606,4 +645,104 @@ test "make: a non-PNG app_icon is refused" {
     var in = try f.inputs(a, test_settings);
     in.identity.app_icon = "icon.jpg";
     try std.testing.expectError(error.InvalidAppIcon, make(a, io, in));
+}
+
+test "make: assets linked from inside the project ship their contents; outside is refused" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // symlinks need privileges
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try Fixture.init(a);
+    defer f.tmp.cleanup();
+    const in = try f.inputs(a, test_settings);
+    try f.tmp.dir.createDirPath(io, "art/levels");
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "art/logo.txt", .data = "LOGO" });
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "art/levels/1.json", .data = "L1" });
+    try f.tmp.dir.symLink(io, "../../art/logo.txt", "target/assets/logo.txt", .{});
+    try f.tmp.dir.symLink(io, "../../art/levels", "target/assets/levels", .{});
+    const app = try make(a, io, in);
+    const read = struct {
+        fn at(al: std.mem.Allocator, dir: []const u8, rel: []const u8) ![]const u8 {
+            const p = try std.fs.path.join(al, &.{ dir, rel });
+            // A real file in the bundle, not a link back into the project.
+            const st = try std.Io.Dir.cwd().statFile(std.testing.io, p, .{ .follow_symlinks = false });
+            try std.testing.expectEqual(std.Io.File.Kind.file, st.kind);
+            return std.Io.Dir.cwd().readFileAlloc(std.testing.io, p, al, .limited(64));
+        }
+    }.at;
+    try std.testing.expectEqualStrings("LOGO", try read(a, app.path, "assets/logo.txt"));
+    try std.testing.expectEqualStrings("L1", try read(a, app.path, "assets/levels/1.json"));
+
+    // A link leaving the project: refused, and no app is left.
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    try outside.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "SECRET" });
+    const secret = try outside.dir.realPathFileAlloc(io, "secret.txt", a);
+    try f.tmp.dir.symLink(io, secret, "target/assets/secret.txt", .{});
+    try std.testing.expectError(error.AssetLinkOutsideProject, make(a, io, in));
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "target/zig-out/ios", .{}));
+}
+
+test "built: a changed, added or removed asset makes the app stale" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try Fixture.init(a);
+    defer f.tmp.cleanup();
+    const in = try f.inputs(a, test_settings);
+    _ = try make(a, io, in);
+    _ = try built(a, io, in);
+    // Same size, other bytes.
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "target/assets/sub/a.txt", .data = "Z" });
+    try std.testing.expectError(error.StaleApp, built(a, io, in));
+    _ = try make(a, io, in);
+    _ = try built(a, io, in);
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "target/assets/new.txt", .data = "" });
+    try std.testing.expectError(error.StaleApp, built(a, io, in));
+    _ = try make(a, io, in);
+    try f.tmp.dir.deleteFile(io, "target/assets/new.txt");
+    try std.testing.expectError(error.StaleApp, built(a, io, in));
+}
+
+test "make: a failed record write leaves neither the app nor a record" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try Fixture.init(a);
+    defer f.tmp.cleanup();
+    var in = try f.inputs(a, test_settings);
+    _ = try make(a, io, in); // an older app that must not survive
+    in.fail_record_write = true;
+    try std.testing.expectError(error.NoSpaceLeft, make(a, io, in));
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "target/zig-out/ios", .{}));
+    try std.testing.expectError(error.NoBuiltApp, built(a, io, in));
+    // Nor staging debris.
+    var out = try f.tmp.dir.openDir(io, "target/zig-out", .{ .iterate = true });
+    defer out.close(io);
+    var it = out.iterate();
+    while (try it.next(io)) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, ".ios-staging-"));
+    // The next good make puts both in place together.
+    in.fail_record_write = false;
+    const app = try make(a, io, in);
+    try f.tmp.dir.access(io, "target/zig-out/ios/app.json", .{});
+    try std.Io.Dir.cwd().access(io, app.path, .{});
+}
+
+test "make: a project title Windows reserves is not used as the app name" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try Fixture.init(a);
+    defer f.tmp.cleanup();
+    var in = try f.inputs(a, test_settings);
+    for ([_][]const u8{ "CON", "nul", "Aux.game", "com7", "LPT3" }) |title| {
+        in.identity.title = title;
+        try std.testing.expectError(error.InvalidAppName, make(a, io, in));
+    }
+    in.identity.title = "Console";
+    _ = try make(a, io, in);
 }

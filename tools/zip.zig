@@ -70,6 +70,15 @@ pub fn listTree(a: std.mem.Allocator, io: std.Io, root: []const u8) ![]Entry {
 /// path is in `executables` get mode 0755 (on every host: Windows has no
 /// executable bit to read); every other file 0644, directories 0755.
 pub fn zipTree(a: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []const u8, executables: []const []const u8, out_path: []const u8) !void {
+    return zipTreeHooked(a, io, root, prefix, executables, out_path, .{});
+}
+
+/// Test seam: runs between a file's checksum pass and its copy pass.
+pub const Hooks = struct {
+    between_passes: ?struct { ctx: *anyopaque, run: *const fn (*anyopaque, []const u8) anyerror!void } = null,
+};
+
+pub fn zipTreeHooked(a: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []const u8, executables: []const []const u8, out_path: []const u8, hooks: Hooks) !void {
     const entries = try listTree(a, io, root);
     if (entries.len + 1 > std.math.maxInt(u16)) return error.TooManyZipEntries;
 
@@ -100,8 +109,9 @@ pub fn zipTree(a: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []con
         // Two streaming passes: the CRC and size the local header needs
         // first, then the bytes.
         const sum = try checksum(io, native, &chunk);
+        if (hooks.between_passes) |h| try h.run(h.ctx, native);
         offset += try writeHeader(w, name, sum.size, sum.crc);
-        try copyExactly(io, native, w, &chunk, sum.size);
+        try copyExactly(io, native, w, &chunk, sum);
         offset += sum.size;
         const mode: u32 = if (contains(executables, e.path)) 0o100755 else 0o100644;
         try central.append(a, .{ .name = name, .crc = sum.crc, .size = sum.size, .mode = mode, .offset = at, .dir = false });
@@ -163,9 +173,13 @@ fn checksum(io: std.Io, path: []const u8, chunk: []u8) !Sum {
     return .{ .crc = crc.final(), .size = std.math.cast(u32, size) orelse return error.ZipTooLarge };
 }
 
-/// Copy the file at `path` into `w` through `chunk`; it must still be
-/// `size` bytes (the header already promised that many).
-fn copyExactly(io: std.Io, path: []const u8, w: *std.Io.Writer, chunk: []u8, size: u32) !void {
+/// Copy the file at `path` into `w` through `chunk`. It must still be what
+/// the checksum pass saw, the size AND the CRC the header already promised:
+/// a file rewritten in between, even at the same length, fails the bundle
+/// instead of producing an archive whose entry does not match its header.
+fn copyExactly(io: std.Io, path: []const u8, w: *std.Io.Writer, chunk: []u8, sum: Sum) !void {
+    const size = sum.size;
+    var crc = std.hash.Crc32.init();
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     var copied: u64 = 0;
@@ -176,10 +190,16 @@ fn copyExactly(io: std.Io, path: []const u8, w: *std.Io.Writer, chunk: []u8, siz
         };
         if (n == 0) break;
         copied += n;
-        if (copied > size) return error.FileChangedWhileZipping;
+        if (copied > size) return changed(path);
+        crc.update(chunk[0..n]);
         try w.writeAll(chunk[0..n]);
     }
-    if (copied != size) return error.FileChangedWhileZipping;
+    if (copied != size or crc.final() != sum.crc) return changed(path);
+}
+
+fn changed(path: []const u8) error{FileChangedWhileZipping} {
+    std.debug.print("labelle-ios: {s} changed while it was being zipped; bundle again\n", .{path});
+    return error.FileChangedWhileZipping;
 }
 
 /// A local file header for an entry of `size` stored bytes; the data follows.
@@ -331,4 +351,28 @@ test "zipTree streams: a file far larger than the allocations it causes" {
     const local = u32At(z, i + 42);
     const name_len = U16.at(z, local + 26);
     try std.testing.expectEqualSlices(u8, data, z[local + 30 + name_len ..][0..big_len]);
+}
+
+test "zipTree: a file rewritten at the same length between the passes fails the bundle" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "X.app");
+    try tmp.dir.writeFile(io, .{ .sub_path = "X.app/game", .data = "ORIGINAL" });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Rewrite = struct {
+        fn run(_: *anyopaque, path: []const u8) anyerror!void {
+            // Same length, other bytes: only the CRC can tell.
+            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "REWRITES" });
+        }
+    };
+    var unused: u8 = 0;
+    try std.testing.expectError(error.FileChangedWhileZipping, zipTreeHooked(a, io, try std.fs.path.join(a, &.{ base, "X.app" }), "X.app", &.{}, try std.fs.path.join(a, &.{ base, "x.zip" }), .{
+        .between_passes = .{ .ctx = &unused, .run = Rewrite.run },
+    }));
+    // Without a rewrite the same tree zips.
+    try zipTree(a, io, try std.fs.path.join(a, &.{ base, "X.app" }), "X.app", &.{}, try std.fs.path.join(a, &.{ base, "y.zip" }));
 }

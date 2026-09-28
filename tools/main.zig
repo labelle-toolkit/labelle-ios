@@ -275,5 +275,6 @@ test {
     _ = @import("plist.zig");
     _ = @import("simctl.zig");
     _ = @import("zip.zig");
+    _ = @import("assets.zig");
     _ = @import("proc.zig");
 }
