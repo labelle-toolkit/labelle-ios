@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const contract = @import("contract.zig");
 const simctl = @import("simctl.zig");
 const app_mod = @import("app.zig");
+const settings_mod = @import("settings.zig");
 const proc = @import("proc.zig");
 
 pub const Inputs = struct {
@@ -56,17 +57,25 @@ pub fn launchHook(a: std.mem.Allocator, io: std.Io, in: Inputs) !u8 {
     // `-- --device=` beats the settings' `simulator.device`: the one-off
     // choice on the command line overrides the project's default.
     const want = args.device orelse settings.simulator.device;
-    const device = simctl.pick(devices, want) orelse {
+    // Automatic choice: a device of the app's family on a runtime that meets
+    // `minimum_ios`, or `simctl install` would refuse it.
+    const need: simctl.Need = .{
+        .family = simctl.Family.fromDeviceFamily(settings.device_family),
+        .minimum = settings_mod.osTriple(settings.minimum_ios) orelse .{ 0, 0, 0 },
+    };
+    const device = simctl.pick(devices, want, need) orelse {
         if (want) |w| {
             std.debug.print("labelle-ios: no available iOS simulator matches '{s}'. Available:\n", .{w});
         } else {
-            std.debug.print("labelle-ios: no iPhone simulator available: install an iOS simulator runtime (Xcode > Settings > Components, or `xcodebuild -downloadPlatform iOS`). Available iOS devices:\n", .{});
+            std.debug.print("labelle-ios: no {s} simulator on iOS {s} or newer available: install an iOS simulator runtime (Xcode > Settings > Components, or `xcodebuild -downloadPlatform iOS`). Available iOS devices:\n", .{ need.family.label(), settings.minimum_ios });
         }
         for (devices) |d| std.debug.print("  {s}  {s} (iOS {d}.{d}, {s})\n", .{ d.udid, d.name, d.version[0], d.version[1], d.state });
         if (devices.len == 0) std.debug.print("  (none)\n", .{});
         return error.NoSimulator;
     };
     std.debug.print("labelle-ios: simulator {s} ({s}, iOS {d}.{d}, {s})\n", .{ device.name, device.udid, device.version[0], device.version[1], device.state });
+    if (want != null and !need.met(device))
+        std.debug.print("labelle-ios: note: {s} is not an {s} on iOS {s} or newer (providers/ios.json); the install may be refused\n", .{ device.name, need.family.label(), settings.minimum_ios });
 
     if (!device.booted()) {
         std.debug.print("labelle-ios: booting {s}...\n", .{device.name});
@@ -199,7 +208,13 @@ fn supervisePosix(a: std.mem.Allocator, io: std.Io, s: Supervise) !Result {
     const outcome: Outcome = while (true) {
         const term = pollTerm(pid);
         const signalled = stop_signal.load(.acquire) != 0;
-        if (classify(term, signalled)) |done| return done;
+        if (classify(term, signalled)) |done| {
+            // The launch ended with the user's stop: `simctl` passes the
+            // signal to the app, but make sure nothing is left running.
+            // "Nothing to terminate" is the expected answer, so it is quiet.
+            if (done.outcome == .interrupted) _ = proc.run(a, io, s.terminate_argv, .{}) catch {};
+            return done;
+        }
         if (signalled) break .interrupted;
         if (s.timeout_ms) |t| if (nowMs(io) -| start >= t) break .timed_out;
         io.sleep(.fromMilliseconds(50), .awake) catch {};

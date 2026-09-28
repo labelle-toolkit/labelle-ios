@@ -328,7 +328,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
         _, out = run('run', '--platform=ios', '--', '--device=iPhone 99', ok=False)
         assert "no available iOS simulator matches 'iPhone 99'" in out and 'IPHONE16-0001  iPhone 16' in out, out
         _, out = run('run', '--platform=ios', ok=False, extra_env={'FAKE_DEVICES': json.dumps({'devices': {}})})
-        assert 'no iPhone simulator available: install an iOS simulator runtime' in out, out
+        assert 'no iPhone simulator on iOS 15.0 or newer available: install an iOS simulator runtime' in out, out
         _, out = run('run', '--platform=ios', ok=False, extra_env={'FAKE_FAIL': 'install'})
         assert 'could not install the app' in out and 'failing on request' in out, out
 
@@ -374,6 +374,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
         assert proc.returncode == 0, (proc.returncode, out)
         assert 'FAKE_APP interrupted' in out and 'stopped the app on a termination signal' in out, out
         assert 'the app exited (status 130)' not in out, out
+        # Nothing may be left running: the app is terminated all the same.
+        assert simctl()[-1] == ['terminate', 'IPHONE16-0001', 'com.labelle.fixture'], simctl()
 
         # `simctl terminate` failing (twice) with the app still running is
         # reported, not hidden: non-zero.
@@ -394,6 +396,18 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
         reset_log()
         run('run', '--platform=ios', extra_env={'FAKE_DEVICES': json.dumps(renamed)})
         assert simctl()[1] == ['bootstatus', 'RENAMED', '-b'], simctl()
+
+        # The automatic choice meets the app: an iPad-only app goes to the
+        # (booted) iPad, and a minimum iOS no runtime meets is explained.
+        settings.write_text(json.dumps(dict(good, device_family='2')))
+        run('build', '--platform=ios')
+        reset_log()
+        run('run', '--platform=ios')
+        assert [c[0] for c in simctl()] == ['list', 'install', 'launch'] and simctl()[1][1] == 'IPAD-0001', simctl()
+        settings.write_text(json.dumps(dict(good, minimum_ios='19.0')))
+        _, out = run('run', '--platform=ios', ok=False)
+        assert 'no iPhone simulator on iOS 19.0 or newer available' in out, out
+        settings.write_text(json.dumps(good))
 
         # No xcrun on PATH (a Linux host without the fakes): a clear refusal.
         path_without = os.pathsep.join(d for d in env['PATH'].split(os.pathsep) if Path(d) != bin_dir and d != '/usr/bin')

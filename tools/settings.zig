@@ -161,6 +161,16 @@ pub fn teamId(value: []const u8) bool {
     return true;
 }
 
+/// `N.N[.N]` as three numbers, or null when malformed.
+pub fn osTriple(value: []const u8) ?[3]u32 {
+    _ = osVersion(value) orelse return null;
+    var out: [3]u32 = .{ 0, 0, 0 };
+    var it = std.mem.splitScalar(u8, value, '.');
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) out[i] = std.fmt.parseInt(u32, part, 10) catch return null;
+    return out;
+}
+
 /// The major version of `N.N[.N]`, or null when malformed.
 pub fn osVersion(value: []const u8) ?u32 {
     var parts: usize = 0;
@@ -300,6 +310,12 @@ test "every rejection names its reason" {
 test "bundleId follows the CFBundleIdentifier rule" {
     for ([_][]const u8{ "com.a", "com.labelle.flying-platform", "io.Studio.Game2", "a.b.c.d", "com.1up" }) |ok| try std.testing.expect(bundleId(ok));
     for ([_][]const u8{ "", "com", "com.", ".com", "com..a", "com.a_b", "com.a b", "1.a", "-a.b", "com.a/b" }) |bad| try std.testing.expect(!bundleId(bad));
+}
+
+test "osTriple" {
+    try std.testing.expectEqual([3]u32{ 15, 0, 0 }, osTriple("15.0").?);
+    try std.testing.expectEqual([3]u32{ 17, 2, 1 }, osTriple("17.2.1").?);
+    try std.testing.expect(osTriple("15") == null);
 }
 
 test "osVersion reads N.N and N.N.N majors" {

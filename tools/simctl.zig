@@ -34,9 +34,48 @@ pub const Device = struct {
         if (d.device_type) |t| return std.mem.startsWith(u8, t, iphone_type_prefix);
         return std.mem.startsWith(u8, d.name, "iPhone");
     }
+
+    pub fn ipad(d: Device) bool {
+        if (d.device_type) |t| return std.mem.startsWith(u8, t, ipad_type_prefix);
+        return std.mem.startsWith(u8, d.name, "iPad");
+    }
 };
 
 pub const iphone_type_prefix = "com.apple.CoreSimulator.SimDeviceType.iPhone-";
+pub const ipad_type_prefix = "com.apple.CoreSimulator.SimDeviceType.iPad";
+
+/// The kind of device an automatic choice looks for.
+pub const Family = enum {
+    iphone,
+    ipad,
+
+    /// `UIDeviceFamily` "2" is iPad-only; "1" and "1,2" run on an iPhone.
+    pub fn label(f: Family) []const u8 {
+        return switch (f) {
+            .iphone => "iPhone",
+            .ipad => "iPad",
+        };
+    }
+
+    pub fn fromDeviceFamily(device_family: []const u8) Family {
+        return if (std.mem.eql(u8, device_family, "2")) .ipad else .iphone;
+    }
+};
+
+/// What an automatically chosen simulator must satisfy for the app to
+/// install: its family and `MinimumOSVersion`.
+pub const Need = struct {
+    family: Family = .iphone,
+    minimum: [3]u32 = .{ 0, 0, 0 },
+
+    pub fn met(n: Need, d: Device) bool {
+        const family_ok = switch (n.family) {
+            .iphone => d.iphone(),
+            .ipad => d.ipad(),
+        };
+        return family_ok and std.mem.order(u32, &d.version, &n.minimum) != .lt;
+    }
+};
 
 /// `xcrun simctl list -j devices available`.
 pub const list_args = [_][]const u8{ "simctl", "list", "-j", "devices", "available" };
@@ -116,8 +155,8 @@ fn best(devices: []const Device, ctx: anytype, comptime accept: fn (@TypeOf(ctx)
     return chosen;
 }
 
-fn isIphone(_: void, d: Device) bool {
-    return d.iphone();
+fn meets(need: Need, d: Device) bool {
+    return need.met(d);
 }
 
 fn isUdid(want: []const u8, d: Device) bool {
@@ -128,11 +167,12 @@ fn isNamed(want: []const u8, d: Device) bool {
     return std.mem.eql(u8, d.name, want);
 }
 
-/// The device to run on. `want` (a UDID, else a device name) when given;
-/// otherwise a booted iPhone, else an iPhone of the newest iOS runtime.
-pub fn pick(devices: []const Device, want: ?[]const u8) ?Device {
+/// The device to run on. `want` (a UDID, else a device name) when given,
+/// taken as asked; otherwise, among the devices that meet `need` (the app's
+/// family and minimum iOS), a booted one, else one of the newest runtime.
+pub fn pick(devices: []const Device, want: ?[]const u8, need: Need) ?Device {
     if (want) |w| return best(devices, w, isUdid) orelse best(devices, w, isNamed);
-    return best(devices, {}, isIphone);
+    return best(devices, need, meets);
 }
 
 /// What the `launch` hook takes from `labelle run ... -- <args>`: a
@@ -257,29 +297,29 @@ test "pick: newest-runtime iPhone when none is booted; a booted iPhone wins" {
     defer arena.deinit();
     const devices = try parseDevices(arena.allocator(), listing);
     // Nothing booted: the first iPhone of iOS 18.2, never the iPad or the watch.
-    try std.testing.expectEqualStrings("22222222-0000-0000-0000-000000000001", pick(devices, null).?.udid);
+    try std.testing.expectEqualStrings("22222222-0000-0000-0000-000000000001", pick(devices, null, .{}).?.udid);
     // A booted iPhone on an older runtime is preferred (no boot needed).
     devices[0].state = "Booted";
-    try std.testing.expectEqualStrings("11111111-0000-0000-0000-000000000001", pick(devices, null).?.udid);
+    try std.testing.expectEqualStrings("11111111-0000-0000-0000-000000000001", pick(devices, null, .{}).?.udid);
     // A booted iPad does not count as an iPhone.
     devices[0].state = "Shutdown";
     devices[1].state = "Booted";
-    try std.testing.expectEqualStrings("22222222-0000-0000-0000-000000000001", pick(devices, null).?.udid);
+    try std.testing.expectEqualStrings("22222222-0000-0000-0000-000000000001", pick(devices, null, .{}).?.udid);
 }
 
 test "pick: an explicit UDID or name; unknown is null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const devices = try parseDevices(arena.allocator(), listing);
-    try std.testing.expectEqualStrings("iPad Air 11-inch (M2)", pick(devices, "11111111-0000-0000-0000-00000000000A").?.name);
+    try std.testing.expectEqualStrings("iPad Air 11-inch (M2)", pick(devices, "11111111-0000-0000-0000-00000000000A", .{}).?.name);
     // UDIDs compare case-insensitively.
-    try std.testing.expectEqualStrings("iPad Air 11-inch (M2)", pick(devices, "11111111-0000-0000-0000-00000000000a").?.name);
-    try std.testing.expectEqualStrings("22222222-0000-0000-0000-000000000002", pick(devices, "iPhone 16").?.udid);
+    try std.testing.expectEqualStrings("iPad Air 11-inch (M2)", pick(devices, "11111111-0000-0000-0000-00000000000a", .{}).?.name);
+    try std.testing.expectEqualStrings("22222222-0000-0000-0000-000000000002", pick(devices, "iPhone 16", .{}).?.udid);
     // A name on two runtimes: the newer one (the unavailable 18.2 copy was dropped).
-    try std.testing.expectEqualStrings("11111111-0000-0000-0000-000000000001", pick(devices, "iPhone 15").?.udid);
-    try std.testing.expect(pick(devices, "iPhone 99") == null);
-    try std.testing.expect(pick(devices, "AAAAAAAA-0000-0000-0000-000000000001") == null); // the watch
-    try std.testing.expect(pick(&.{}, null) == null);
+    try std.testing.expectEqualStrings("11111111-0000-0000-0000-000000000001", pick(devices, "iPhone 15", .{}).?.udid);
+    try std.testing.expect(pick(devices, "iPhone 99", .{}) == null);
+    try std.testing.expect(pick(devices, "AAAAAAAA-0000-0000-0000-000000000001", .{}) == null); // the watch
+    try std.testing.expect(pick(&.{}, null, .{}) == null);
 }
 
 test "parseRunArgs: --device in both spellings; the rest reaches the app" {
@@ -338,15 +378,34 @@ test "pick: an iPhone is recognised by its device type, not its name" {
     );
     try std.testing.expect(!devices[0].iphone());
     try std.testing.expect(devices[1].iphone());
-    try std.testing.expectEqualStrings("RENAMED", pick(devices, null).?.udid);
+    try std.testing.expectEqualStrings("RENAMED", pick(devices, null, .{}).?.udid);
     // A listing without device types (old Xcode) still works by name.
     const old = try parseDevices(arena.allocator(),
         \\{ "devices": { "com.apple.CoreSimulator.SimRuntime.iOS-14-5": [
         \\  { "udid": "OLD", "isAvailable": true, "state": "Shutdown", "name": "iPhone 12" } ] } }
     );
-    try std.testing.expectEqualStrings("OLD", pick(old, null).?.udid);
+    try std.testing.expectEqualStrings("OLD", pick(old, null, .{}).?.udid);
     try std.testing.expectError(error.InvalidSimctlOutput, parseDevices(arena.allocator(),
         \\{ "devices": { "com.apple.CoreSimulator.SimRuntime.iOS-18-2": [
         \\  { "udid": "X", "state": "Shutdown", "name": "x", "deviceTypeIdentifier": 7 } ] } }
     ));
+}
+
+test "pick: the automatic choice meets the app's family and minimum iOS" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const devices = try parseDevices(arena.allocator(), listing);
+    // iPad-only app: the iPad, never an iPhone.
+    try std.testing.expectEqualStrings("11111111-0000-0000-0000-00000000000A", pick(devices, null, .{ .family = .ipad }).?.udid);
+    // A booted iPhone on a runtime older than minimum_ios is passed over.
+    devices[0].state = "Booted"; // iPhone 15, iOS 17.5
+    try std.testing.expectEqualStrings("11111111-0000-0000-0000-000000000001", pick(devices, null, .{}).?.udid);
+    try std.testing.expectEqualStrings("22222222-0000-0000-0000-000000000001", pick(devices, null, .{ .minimum = .{ 18, 0, 0 } }).?.udid);
+    // Nothing new enough: none (the caller explains).
+    try std.testing.expect(pick(devices, null, .{ .minimum = .{ 19, 0, 0 } }) == null);
+    // An explicit choice is taken as asked; the caller notes the mismatch.
+    try std.testing.expectEqualStrings("iPhone 15", pick(devices, "iPhone 15", .{ .minimum = .{ 19, 0, 0 } }).?.name);
+    try std.testing.expectEqual(Family.ipad, Family.fromDeviceFamily("2"));
+    try std.testing.expectEqual(Family.iphone, Family.fromDeviceFamily("1,2"));
+    try std.testing.expectEqual(Family.iphone, Family.fromDeviceFamily("1"));
 }

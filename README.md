@@ -85,8 +85,9 @@ labelle run --platform=ios --timeout=30s            # stop the app after 30 s
 ```
 
 - **Which simulator:** `-- --device=<udid|name>`, else `simulator.device` from
-  the settings, else a booted iPhone, else an iPhone of the newest installed
-  iOS runtime. An iPhone is recognised by its device type
+  the settings (either taken as asked), else automatically among the devices
+  that can install the app, an iPhone (an iPad when `device_family` is `"2"`)
+  on iOS `minimum_ios` or newer: a booted one, else one of the newest runtime. An iPhone is recognised by its device type
   (`com.apple.CoreSimulator.SimDeviceType.iPhone-*`), so a renamed one counts. A name on several runtimes picks the booted one, else the
   newest. Other arguments after `--` are passed to the app.
 - **Run options** (`--scene`, `--profile`, `--screenshot`, `--after`) become
