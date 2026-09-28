@@ -184,7 +184,7 @@ fn deviceFamily(value: []const u8) bool {
     return false;
 }
 
-fn displayText(value: []const u8) bool {
+pub fn displayText(value: []const u8) bool {
     if (std.mem.trim(u8, value, " \t").len == 0) return false;
     for (value) |c| {
         if (std.ascii.isControl(c)) return false;

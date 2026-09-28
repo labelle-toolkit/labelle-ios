@@ -74,10 +74,10 @@ DEVICES = {
         'com.apple.CoreSimulator.SimRuntime.watchOS-11-2': [
             {'udid': 'WATCH-0001', 'isAvailable': True, 'state': 'Booted', 'name': 'Apple Watch Series 10 (46mm)'}],
         'com.apple.CoreSimulator.SimRuntime.iOS-17-5': [
-            {'udid': 'IPHONE15-OLD', 'isAvailable': True, 'state': 'Shutdown', 'name': 'iPhone 15'}],
+            {'udid': 'IPHONE15-OLD', 'isAvailable': True, 'state': 'Shutdown', 'name': 'iPhone 15', 'deviceTypeIdentifier': 'com.apple.CoreSimulator.SimDeviceType.iPhone-15'}],
         'com.apple.CoreSimulator.SimRuntime.iOS-18-2': [
-            {'udid': 'IPAD-0001', 'isAvailable': True, 'state': 'Booted', 'name': 'iPad Air 11-inch (M2)'},
-            {'udid': 'IPHONE16-0001', 'isAvailable': True, 'state': 'Shutdown', 'name': 'iPhone 16'},
+            {'udid': 'IPAD-0001', 'isAvailable': True, 'state': 'Booted', 'name': 'iPad Air 11-inch (M2)', 'deviceTypeIdentifier': 'com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M2'},
+            {'udid': 'IPHONE16-0001', 'isAvailable': True, 'state': 'Shutdown', 'name': 'iPhone 16', 'deviceTypeIdentifier': 'com.apple.CoreSimulator.SimDeviceType.iPhone-16'},
         ],
     }
 }
@@ -118,6 +118,8 @@ elif sub == "install":
 elif sub == "terminate":
     (state / "terminated").write_text(args[3])
 elif sub == "launch":
+    import signal
+    signal.signal(signal.SIGINT, lambda *_: (print("FAKE_APP interrupted", flush=True), os._exit(130)))
     assert args[2:4] == ["--console-pty", "--terminate-running-process"], args
     (state / "terminated").unlink(missing_ok=True)
     print("FAKE_APP started " + args[5] + " args=" + json.dumps(args[6:]), flush=True)
@@ -339,21 +341,59 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
         assert simctl()[-1] == ['terminate', 'IPHONE16-0001', 'com.labelle.fixture'], simctl()
         assert elapsed < 120, elapsed
 
+        def held_run(extra_env=None, args=()):
+            """`labelle run` in the background with the fake app held open;
+            returns the process and the provider tool's pid."""
+            (state / 'launch.pid').unlink(missing_ok=True)
+            proc = subprocess.Popen([cli, 'run', '--platform=ios', *args], cwd=project,
+                                    env=dict(env, FAKE_APP_HOLD='1', **(extra_env or {})),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
+            deadline = time.monotonic() + 600
+            while not (state / 'launch.pid').exists():
+                assert proc.poll() is None and time.monotonic() < deadline, proc.communicate()[0]
+                time.sleep(0.1)
+            launch_pid, tool_pid = (int(x) for x in (state / 'launch.pid').read_text().split())
+            return proc, launch_pid, tool_pid
+
         # SIGTERM to the provider tool: the same clean stop, status 0.
         reset_log()
-        (state / 'launch.pid').unlink(missing_ok=True)
-        proc = subprocess.Popen([cli, 'run', '--platform=ios'], cwd=project, env=dict(env, FAKE_APP_HOLD='1'),
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
-        deadline = time.monotonic() + 600
-        while not (state / 'launch.pid').exists():
-            assert proc.poll() is None and time.monotonic() < deadline, proc.communicate()[0]
-            time.sleep(0.1)
-        tool_pid = int((state / 'launch.pid').read_text().split()[1])
+        proc, _, tool_pid = held_run()
         os.kill(tool_pid, signal.SIGTERM)
         out = proc.communicate(timeout=120)[0]
         assert proc.returncode == 0, (proc.returncode, out)
         assert 'stopped the app on a termination signal' in out and 'FAKE_APP terminated' in out, out
         assert simctl()[-1] == ['terminate', 'IPHONE16-0001', 'com.labelle.fixture'], simctl()
+
+        # Ctrl-C on a terminal: SIGINT to the tool AND to simctl, which passes
+        # it to the app and exits 130. That is the user's stop: status 0.
+        reset_log()
+        proc, launch_pid, tool_pid = held_run()
+        os.kill(tool_pid, signal.SIGINT)
+        os.kill(launch_pid, signal.SIGINT)
+        out = proc.communicate(timeout=120)[0]
+        assert proc.returncode == 0, (proc.returncode, out)
+        assert 'FAKE_APP interrupted' in out and 'stopped the app on a termination signal' in out, out
+        assert 'the app exited (status 130)' not in out, out
+
+        # `simctl terminate` failing (twice) with the app still running is
+        # reported, not hidden: non-zero.
+        reset_log()
+        code, out = run('run', '--platform=ios', '--timeout=2s', ok=False,
+                        extra_env={'FAKE_APP_HOLD': '1', 'FAKE_FAIL': 'terminate'})
+        assert code == 1, (code, out)
+        assert 'could not stop the app on the simulator' in out and 'may still be running' in out, out
+        assert [c[0] for c in simctl()].count('terminate') == 2, simctl()
+
+        # A renamed iPhone is still an iPhone (device type, not name), and an
+        # iPad named like an iPhone is not.
+        renamed = {'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-18-2': [
+            {'udid': 'LOOKALIKE', 'isAvailable': True, 'state': 'Shutdown', 'name': 'iPhone lookalike',
+             'deviceTypeIdentifier': 'com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M4'},
+            {'udid': 'RENAMED', 'isAvailable': True, 'state': 'Shutdown', 'name': 'labelle CI phone',
+             'deviceTypeIdentifier': 'com.apple.CoreSimulator.SimDeviceType.iPhone-16'}]}}
+        reset_log()
+        run('run', '--platform=ios', extra_env={'FAKE_DEVICES': json.dumps(renamed)})
+        assert simctl()[1] == ['bootstatus', 'RENAMED', '-b'], simctl()
 
         # No xcrun on PATH (a Linux host without the fakes): a clear refusal.
         path_without = os.pathsep.join(d for d in env['PATH'].split(os.pathsep) if Path(d) != bin_dir and d != '/usr/bin')
@@ -378,6 +418,19 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
         mode = z.getinfo('Fixture_Game.app/game').external_attr >> 16
         assert mode == 0o100755, oct(mode)
         assert (z.getinfo('Fixture_Game.app/Info.plist').external_attr >> 16) == 0o100644
+        info = z.read('Fixture_Game.app/Info.plist').decode()
+        assert '<key>CFBundleVersion</key>\n    <string>1</string>' in info, info
+
+    # --build-number stamps CFBundleVersion; anything but a positive integer
+    # is refused.
+    run('bundle', '--platform=ios', '--build-number=7')
+    with zipfile.ZipFile(archive) as z:
+        info = z.read('Fixture_Game.app/Info.plist').decode()
+        assert '<key>CFBundleVersion</key>\n    <string>7</string>' in info, info
+    assert '<string>7</string>' in (app / 'Info.plist').read_text()
+    _, out = run('bundle', '--platform=ios', '--build-number=1.2', ok=False)
+    assert "--build-number '1.2' is not a CFBundleVersion" in out, out
+
     elsewhere = temp / 'release-out'
     run('bundle', '--platform=ios', f'--output={elsewhere}')
     assert [f.name for f in elsewhere.iterdir()] == ['Fixture_Game-simulator.zip'], list(elsewhere.iterdir())

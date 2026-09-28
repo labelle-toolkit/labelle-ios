@@ -77,29 +77,34 @@ pub fn zipTree(a: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []con
     defer out.close(io);
     var buf: [64 * 1024]u8 = undefined;
     var fw = out.writer(io, &buf);
+    // File contents pass through this buffer only: nothing proportional to
+    // a file's size is allocated, whatever the app holds.
+    var chunk: [64 * 1024]u8 = undefined;
     const w = &fw.interface;
 
     var central: std.ArrayList(Central) = .empty;
     var offset: u64 = 0;
     const top = try std.fmt.allocPrint(a, "{s}/", .{prefix});
-    offset += try writeLocal(w, top, &.{}, 0);
+    offset += try writeHeader(w, top, 0, 0);
     try central.append(a, .{ .name = top, .crc = 0, .size = 0, .mode = 0o40755, .offset = 0, .dir = true });
     for (entries) |e| {
         const at = std.math.cast(u32, offset) orelse return error.ZipTooLarge;
         if (e.dir) {
             const name = try std.fmt.allocPrint(a, "{s}/{s}/", .{ prefix, e.path });
-            offset += try writeLocal(w, name, &.{}, 0);
+            offset += try writeHeader(w, name, 0, 0);
             try central.append(a, .{ .name = name, .crc = 0, .size = 0, .mode = 0o40755, .offset = at, .dir = true });
             continue;
         }
         const name = try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, e.path });
         const native = try std.fs.path.join(a, &.{ root, e.path });
-        const data = try std.Io.Dir.cwd().readFileAlloc(io, native, a, .limited(std.math.maxInt(u32)));
-        const crc = std.hash.Crc32.hash(data);
-        offset += try writeLocal(w, name, data, crc);
+        // Two streaming passes: the CRC and size the local header needs
+        // first, then the bytes.
+        const sum = try checksum(io, native, &chunk);
+        offset += try writeHeader(w, name, sum.size, sum.crc);
+        try copyExactly(io, native, w, &chunk, sum.size);
+        offset += sum.size;
         const mode: u32 = if (contains(executables, e.path)) 0o100755 else 0o100644;
-        try central.append(a, .{ .name = name, .crc = crc, .size = @intCast(data.len), .mode = mode, .offset = at, .dir = false });
-        a.free(data);
+        try central.append(a, .{ .name = name, .crc = sum.crc, .size = sum.size, .mode = mode, .offset = at, .dir = false });
     }
 
     const cd_start = std.math.cast(u32, offset) orelse return error.ZipTooLarge;
@@ -138,8 +143,47 @@ pub fn zipTree(a: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []con
     try w.flush();
 }
 
-fn writeLocal(w: *std.Io.Writer, name: []const u8, data: []const u8, crc: u32) !u64 {
-    const size = std.math.cast(u32, data.len) orelse return error.ZipTooLarge;
+const Sum = struct { crc: u32, size: u32 };
+
+/// CRC-32 and size of the file at `path`, read through `chunk`.
+fn checksum(io: std.Io, path: []const u8, chunk: []u8) !Sum {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var crc = std.hash.Crc32.init();
+    var size: u64 = 0;
+    while (true) {
+        const n = file.readStreaming(io, &.{chunk}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        crc.update(chunk[0..n]);
+        size += n;
+    }
+    return .{ .crc = crc.final(), .size = std.math.cast(u32, size) orelse return error.ZipTooLarge };
+}
+
+/// Copy the file at `path` into `w` through `chunk`; it must still be
+/// `size` bytes (the header already promised that many).
+fn copyExactly(io: std.Io, path: []const u8, w: *std.Io.Writer, chunk: []u8, size: u32) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var copied: u64 = 0;
+    while (true) {
+        const n = file.readStreaming(io, &.{chunk}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        copied += n;
+        if (copied > size) return error.FileChangedWhileZipping;
+        try w.writeAll(chunk[0..n]);
+    }
+    if (copied != size) return error.FileChangedWhileZipping;
+}
+
+/// A local file header for an entry of `size` stored bytes; the data follows.
+fn writeHeader(w: *std.Io.Writer, name: []const u8, size: u32, crc: u32) !u64 {
     if (name.len > std.math.maxInt(u16)) return error.ZipNameTooLong;
     try w.writeInt(u32, local_sig, .little);
     try w.writeInt(u16, version_needed, .little);
@@ -153,8 +197,7 @@ fn writeLocal(w: *std.Io.Writer, name: []const u8, data: []const u8, crc: u32) !
     try w.writeInt(u16, @intCast(name.len), .little);
     try w.writeInt(u16, 0, .little);
     try w.writeAll(name);
-    try w.writeAll(data);
-    return 30 + name.len + data.len;
+    return 30 + name.len;
 }
 
 fn contains(list: []const []const u8, item: []const u8) bool {
@@ -248,4 +291,44 @@ test "zipTree is deterministic" {
         try std.Io.Dir.cwd().readFileAlloc(io, one, a, .limited(1 << 20)),
         try std.Io.Dir.cwd().readFileAlloc(io, two, a, .limited(1 << 20)),
     );
+}
+
+test "zipTree streams: a file far larger than the allocations it causes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 4 MiB of position-dependent bytes, several chunks plus a partial tail.
+    const big_len = 4 * 1024 * 1024 + 1234;
+    const data = try std.testing.allocator.alloc(u8, big_len);
+    defer std.testing.allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 9));
+    try tmp.dir.createDirPath(io, "Big.app");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Big.app/game", .data = data });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ base, "Big.app" });
+    defer std.testing.allocator.free(root);
+    const out = try std.fs.path.join(std.testing.allocator, &.{ base, "big.zip" });
+    defer std.testing.allocator.free(out);
+
+    // Everything zipTree allocates, arena included, is counted here.
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var arena = std.heap.ArenaAllocator.init(counting.allocator());
+        defer arena.deinit();
+        try zipTree(arena.allocator(), io, root, "Big.app", &.{"game"}, out);
+    }
+    try std.testing.expect(counting.allocated_bytes < 256 * 1024);
+
+    // And the archive holds the file intact.
+    const z = try std.Io.Dir.cwd().readFileAlloc(io, out, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(z);
+    const eocd = z.len - 22;
+    var i: usize = u32At(z, eocd + 16);
+    i += 46 + U16.at(z, i + 28); // the Big.app/ directory entry
+    try std.testing.expectEqual(@as(u32, big_len), u32At(z, i + 24));
+    try std.testing.expectEqual(std.hash.Crc32.hash(data), u32At(z, i + 16));
+    const local = u32At(z, i + 42);
+    const name_len = U16.at(z, local + 26);
+    try std.testing.expectEqualSlices(u8, data, z[local + 30 + name_len ..][0..big_len]);
 }

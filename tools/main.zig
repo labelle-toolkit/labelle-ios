@@ -132,27 +132,28 @@ fn execute(init: std.process.Init, out: *std.Io.Writer) !u8 {
 
     // Every hook context carries its target dir (wire 1.2.0+; the manifest
     // admits 1.3.0+ only).
-    const target_dir = ctx.target_dir orelse return error.MissingTargetDir;
+    const app_inputs: app_mod.Inputs = .{
+        .project_dir = ctx.project_dir.?,
+        .target_dir = ctx.target_dir orelse return error.MissingTargetDir,
+        .settings = settings,
+        .settings_bytes = settings_bytes,
+        .identity = identity,
+        // Only a `bundle` hook's context carries it (contract 1.1.0+).
+        .build_number = ctx.build_number,
+        .env = init.environ_map,
+    };
     switch (action) {
         .app_hook => {
-            const app = try app_mod.make(a, io, .{
-                .project_dir = ctx.project_dir.?,
-                .target_dir = target_dir,
-                .settings = settings,
-                .identity = identity,
-                .env = init.environ_map,
-            });
-            std.debug.print("labelle-ios: app ready: {s}\n", .{app});
+            const app = try app_mod.make(a, io, app_inputs);
+            std.debug.print("labelle-ios: app ready: {s}\n", .{app.path});
             return 0;
         },
         .launch_hook => return launch_mod.launchHook(a, io, .{
-            .target_dir = target_dir,
-            .settings = settings,
+            .app = app_inputs,
             .run = ctx.run orelse .{ .env = &.{}, .args = &.{}, .timeout_ms = null },
-            .env = init.environ_map,
         }),
         .bundle_hook => {
-            const archive = try bundle_mod.bundleHook(a, io, target_dir, ctx.output_dir, settings.bundle_id);
+            const archive = try bundle_mod.bundleHook(a, io, app_inputs, ctx.output_dir);
             std.debug.print("labelle-ios: bundle ready: {s}\n", .{archive});
             return 0;
         },

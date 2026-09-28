@@ -57,20 +57,23 @@ in v0.1; it exists because the assembler wires every plugin into the build).
 |---|---|---|
 | `app` | after `build` (target `ios`) | Finds the single executable in `<target_dir>/zig-out/bin` and writes `<target_dir>/zig-out/ios/<AppName>.app`: the executable, `Info.plist`, `PkgInfo`, the project's `app_icon` and `assets/`. On macOS it ad-hoc signs the bundle (`codesign --sign -`), as Xcode does for simulator builds. Refuses when the build produced no executable or more than one. |
 | `launch` | replaces `run` | Picks a simulator, boots it if needed (`simctl bootstatus -b`), installs the app and runs it with `simctl launch --console-pty`, **blocking until the app exits**; the app's output streams to the console and `labelle run` exits with its status. |
-| `bundle` | replaces `bundle` | Zips the simulator `.app` into the bundle output directory (`zig-out/bundle/ios/`, or `--output`) as `<AppName>-simulator.zip`, with Unix modes so the executable bit survives. |
+| `bundle` | replaces `bundle` | Makes the `.app` again with `CFBundleVersion` = `--build-number` (a positive integer, default 1) and zips it into the bundle output directory (`zig-out/bundle/ios/`, or `--output`) as `<AppName>-simulator.zip`, streamed, with Unix modes so the executable bit survives. |
 
 Outputs, under the generated target directory `.labelle/sokol_ios/`:
 
 ```
 zig-out/bin/<exe>                        core build (input; the assembler names it `game`)
 zig-out/ios/<AppName>.app/               `app` hook
-zig-out/ios/app.json                     what the .app was made from
+zig-out/ios/app.json                     what the .app was made from (executable and inputs digests)
 zig-out/bundle/ios/<AppName>-simulator.zip   `bundle` hook
 ```
 
-`<AppName>` is `app_name` (else the project `.title`) with anything but
-letters, digits, `-` and `_` replaced by `_`. A failed `app` hook leaves no
-`.app`: the previous one is removed first and the new one is staged.
+`<AppName>` is `app_name` (else the project `.title`, which must then pass the
+same rule as `app_name`) with anything but letters, digits, `-` and `_`
+replaced by `_`. A failed `app` hook leaves no `.app`: the previous one is
+removed first and the new one is staged. An unreadable `assets/` fails the
+hook; only an absent one is skipped. The `launch` hook refuses an app whose
+executable, settings file, app name or icon changed since it was made.
 
 ### Running
 
@@ -83,13 +86,17 @@ labelle run --platform=ios --timeout=30s            # stop the app after 30 s
 
 - **Which simulator:** `-- --device=<udid|name>`, else `simulator.device` from
   the settings, else a booted iPhone, else an iPhone of the newest installed
-  iOS runtime. A name on several runtimes picks the booted one, else the
+  iOS runtime. An iPhone is recognised by its device type
+  (`com.apple.CoreSimulator.SimDeviceType.iPhone-*`), so a renamed one counts. A name on several runtimes picks the booted one, else the
   newest. Other arguments after `--` are passed to the app.
 - **Run options** (`--scene`, `--profile`, `--screenshot`, `--after`) become
   `LABELLE_*` variables in the app's environment, handed over as
   `SIMCTL_CHILD_LABELLE_*`.
-- **Stopping:** `--timeout`, SIGTERM, SIGINT and SIGHUP stop the app with
-  `simctl terminate` and `labelle run` exits 0. The simulator stays booted.
+- **Stopping:** `--timeout`, SIGTERM, SIGINT (Ctrl-C) and SIGHUP stop the app
+  with `simctl terminate` and `labelle run` exits 0, even when `simctl`
+  itself reports 130 for the Ctrl-C. If `simctl terminate` fails twice while
+  the app is still running, the hook says so and exits 1. The simulator stays
+  booted.
 - **Exit status:** the app's, as `simctl launch` reports it.
 
 ## `providers/ios.json` (schema v1)

@@ -19,15 +19,24 @@ pub const Device = struct {
     runtime: []const u8,
     /// `iOS-18-2` → 18.2.0.
     version: [3]u32,
+    /// e.g. `com.apple.CoreSimulator.SimDeviceType.iPhone-16`; null when the
+    /// listing omits it (Xcode 12 and older).
+    device_type: ?[]const u8 = null,
 
     pub fn booted(d: Device) bool {
         return std.mem.eql(u8, d.state, "Booted");
     }
 
+    /// By the device type, never the display name: a simulator can be
+    /// renamed (`simctl rename`, or `simctl create "<any name>"`). Only a
+    /// listing without device types falls back to the name.
     pub fn iphone(d: Device) bool {
+        if (d.device_type) |t| return std.mem.startsWith(u8, t, iphone_type_prefix);
         return std.mem.startsWith(u8, d.name, "iPhone");
     }
 };
+
+pub const iphone_type_prefix = "com.apple.CoreSimulator.SimDeviceType.iPhone-";
 
 /// `xcrun simctl list -j devices available`.
 pub const list_args = [_][]const u8{ "simctl", "list", "-j", "devices", "available" };
@@ -73,6 +82,10 @@ pub fn parseDevices(a: std.mem.Allocator, bytes: []const u8) ![]Device {
                 .state = try field(o, "state"),
                 .runtime = entry.key_ptr.*,
                 .version = version,
+                .device_type = if (o.get("deviceTypeIdentifier")) |t| switch (t) {
+                    .string => |str| str,
+                    else => return error.InvalidSimctlOutput,
+                } else null,
             });
         }
     }
@@ -196,11 +209,11 @@ const listing =
     \\      { "lastBootedAt" : "2024-10-01T10:00:00Z", "dataPath" : "/x", "dataPathSize" : 1, "logPath" : "/y",
     \\        "udid" : "11111111-0000-0000-0000-000000000001", "isAvailable" : true,
     \\        "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-15", "state" : "Shutdown", "name" : "iPhone 15" },
-    \\      { "udid" : "11111111-0000-0000-0000-00000000000A", "isAvailable" : true, "state" : "Shutdown", "name" : "iPad Air 11-inch (M2)" }
+    \\      { "udid" : "11111111-0000-0000-0000-00000000000A", "isAvailable" : true, "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M2", "state" : "Shutdown", "name" : "iPad Air 11-inch (M2)" }
     \\    ],
     \\    "com.apple.CoreSimulator.SimRuntime.iOS-18-2" : [
-    \\      { "udid" : "22222222-0000-0000-0000-000000000001", "isAvailable" : true, "state" : "Shutdown", "name" : "iPhone 16 Pro" },
-    \\      { "udid" : "22222222-0000-0000-0000-000000000002", "isAvailable" : true, "state" : "Shutdown", "name" : "iPhone 16" },
+    \\      { "udid" : "22222222-0000-0000-0000-000000000001", "isAvailable" : true, "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro", "state" : "Shutdown", "name" : "iPhone 16 Pro" },
+    \\      { "udid" : "22222222-0000-0000-0000-000000000002", "isAvailable" : true, "deviceTypeIdentifier" : "com.apple.CoreSimulator.SimDeviceType.iPhone-16", "state" : "Shutdown", "name" : "iPhone 16" },
     \\      { "udid" : "22222222-0000-0000-0000-000000000003", "isAvailable" : false, "state" : "Shutdown", "name" : "iPhone 15" }
     \\    ]
     \\  }
@@ -310,4 +323,30 @@ test "launchEnv: each run option becomes SIMCTL_CHILD_*; stale ones are dropped"
     try std.testing.expectEqualStrings("2.500", env.get("SIMCTL_CHILD_LABELLE_SCREENSHOT_AFTER_SEC").?);
     const none = try launchEnv(a, &parent, &.{});
     try std.testing.expect(none.get("SIMCTL_CHILD_LABELLE_SCENE") == null);
+}
+
+test "pick: an iPhone is recognised by its device type, not its name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const devices = try parseDevices(arena.allocator(),
+        \\{ "devices": { "com.apple.CoreSimulator.SimRuntime.iOS-18-2": [
+        \\  { "udid": "IPAD", "isAvailable": true, "state": "Shutdown", "name": "iPhone lookalike",
+        \\    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M2" },
+        \\  { "udid": "RENAMED", "isAvailable": true, "state": "Shutdown", "name": "labelle-ios CI phone",
+        \\    "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-16" }
+        \\] } }
+    );
+    try std.testing.expect(!devices[0].iphone());
+    try std.testing.expect(devices[1].iphone());
+    try std.testing.expectEqualStrings("RENAMED", pick(devices, null).?.udid);
+    // A listing without device types (old Xcode) still works by name.
+    const old = try parseDevices(arena.allocator(),
+        \\{ "devices": { "com.apple.CoreSimulator.SimRuntime.iOS-14-5": [
+        \\  { "udid": "OLD", "isAvailable": true, "state": "Shutdown", "name": "iPhone 12" } ] } }
+    );
+    try std.testing.expectEqualStrings("OLD", pick(old, null).?.udid);
+    try std.testing.expectError(error.InvalidSimctlOutput, parseDevices(arena.allocator(),
+        \\{ "devices": { "com.apple.CoreSimulator.SimRuntime.iOS-18-2": [
+        \\  { "udid": "X", "state": "Shutdown", "name": "x", "deviceTypeIdentifier": 7 } ] } }
+    ));
 }

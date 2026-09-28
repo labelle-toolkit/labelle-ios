@@ -7,9 +7,9 @@ macOS with Xcode only. Copies the `tests/ios` fixture (labelle-sokol's
 provider through `local:`) into a scratch directory and, with a clean HOME,
 LABELLE_HOME and Zig cache:
 
-1. makes sure an available iPhone simulator exists in that HOME's device set
-   (creates one from the newest installed iOS runtime when the set is empty;
-   fails with the runtime listing when the image has no iOS runtime at all);
+1. creates an iPhone named "labelle-ios CI device" on the newest installed
+   iOS runtime and boots it alone (fails with the runtime listing when the
+   image has no iOS runtime), so the provider must pick it by device type;
 2. `labelle build --platform=ios`: the core build and the provider's `app` hook;
 3. `labelle run --platform=ios --scene=main --timeout=<t>`: the `launch` hook
    boots the simulator, installs and launches the app; the fixture's script
@@ -17,7 +17,9 @@ LABELLE_HOME and Zig cache:
    LABELLE_SCENE (the run option, forwarded as SIMCTL_CHILD_LABELLE_SCENE);
 4. while the app runs, `xcrun simctl io <udid> screenshot`; the PNG must not be
    blank and must show the fixture's magenta rectangle;
-5. `--timeout` stops the app and `labelle run` exits 0.
+5. `--timeout` stops the app and `labelle run` exits 0;
+6. `labelle bundle --platform=ios --build-number=3`: the zip's Info.plist
+   carries CFBundleVersion 3.
 
 Everything the run printed, the screenshot and a summary land in --out.
 """
@@ -64,28 +66,39 @@ def sh(argv, env, cwd=None, timeout=600, check=True):
     return r
 
 
-def ensure_iphone(env):
-    """An available iPhone in this HOME's device set; created if missing."""
-    listed = json.loads(sh(['xcrun', 'simctl', 'list', '-j', 'devices', 'available'], env).stdout)
-    iphones = [(rt, d) for rt, ds in listed['devices'].items() if '.iOS-' in rt
-               for d in ds if d.get('isAvailable', True) and d['name'].startswith('iPhone')]
+CI_DEVICE = 'labelle-ios CI device'
+
+
+def create_iphone(env):
+    """Create an iPhone on the newest installed iOS runtime, named WITHOUT
+    'iPhone' (the provider must recognise it by device type), and boot it
+    with every other simulator shut down, so the launch hook's default
+    choice (a booted iPhone) has to be this one. Runs every time, so the path
+    that creates a device, needed when a HOME's device set is empty, is
+    exercised even on images that ship simulators. Returns its UDID."""
     runtimes = json.loads(sh(['xcrun', 'simctl', 'list', '-j', 'runtimes', 'available'], env).stdout)['runtimes']
     ios = [r for r in runtimes if r.get('platform') == 'iOS' or r['identifier'].startswith('com.apple.CoreSimulator.SimRuntime.iOS-')]
     summary['ios_runtimes'] = [f"{r['name']} ({r['identifier']})" for r in ios]
-    if iphones:
-        summary['device_set'] = f'{len(iphones)} available iPhone(s) already present'
-        return
     if not ios:
         print(json.dumps(runtimes, indent=2))
         fail('this runner image has no iOS simulator runtime (`xcrun simctl list runtimes available` lists none); '
              'install one with `xcodebuild -downloadPlatform iOS`')
     runtime = max(ios, key=lambda r: [int(x) for x in re.findall(r'\d+', r['version'])])
-    types = [t for t in runtime.get('supportedDeviceTypes', []) if t['name'].startswith('iPhone')]
+    types = [t for t in runtime.get('supportedDeviceTypes', [])
+             if t['identifier'].startswith('com.apple.CoreSimulator.SimDeviceType.iPhone-')]
     if not types:
         fail(f"iOS runtime {runtime['identifier']} supports no iPhone device type")
     kind = types[-1]
-    sh(['xcrun', 'simctl', 'create', 'labelle-ios CI iPhone', kind['identifier'], runtime['identifier']], env)
-    summary['device_set'] = f"created '{kind['name']}' on {runtime['name']} (the clean HOME's device set was empty)"
+    listed = json.loads(sh(['xcrun', 'simctl', 'list', '-j', 'devices'], env).stdout)
+    for ds in listed['devices'].values():
+        for d in ds:
+            if d['name'] == CI_DEVICE:
+                sh(['xcrun', 'simctl', 'delete', d['udid']], env, check=False)
+    udid = sh(['xcrun', 'simctl', 'create', CI_DEVICE, kind['identifier'], runtime['identifier']], env).stdout.strip()
+    sh(['xcrun', 'simctl', 'shutdown', 'all'], env, check=False)
+    sh(['xcrun', 'simctl', 'bootstatus', udid, '-b'], env, timeout=900)
+    summary['created_device'] = {'udid': udid, 'name': CI_DEVICE, 'type': kind['identifier'], 'runtime': runtime['identifier']}
+    return udid
 
 
 def png_pixels(path):
@@ -168,7 +181,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-sim-') as temp:
                # releases the pinned packages expect.
                LABELLE_ALLOW_OLDER_CLI='1')
 
-    ensure_iphone(env)
+    created = create_iphone(env)
 
     r = sh([cli, 'build', '--platform=ios'], env, cwd=project, timeout=3600, check=False)
     (out_dir / 'build.log').write_text(r.stdout + r.stderr)
@@ -224,6 +237,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-sim-') as temp:
     if udid is None:
         fail('the launch hook never named the simulator it used')
     summary['simulator'] = udid
+    if udid != created:
+        fail(f'the launch hook picked {udid}, not the booted, renamed iPhone {created} (device type, not name)')
     time.sleep(2)  # a few more frames on screen
     shot = sh(['xcrun', 'simctl', 'io', udid, 'screenshot', screenshot], env, check=False)
     print(shot.stdout + shot.stderr, flush=True)
@@ -245,6 +260,22 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-sim-') as temp:
         fail('the launch hook did not stop the app on --timeout')
     if code != 0:
         fail(f'labelle run exited {code}')
+
+    # --build-number reaches CFBundleVersion of the bundled .app.
+    r = sh([cli, 'bundle', '--platform=ios', '--build-number=3'], env, cwd=project, timeout=3600, check=False)
+    (out_dir / 'bundle.log').write_text(r.stdout + r.stderr)
+    if r.returncode != 0:
+        fail(f'labelle bundle --platform=ios exited {r.returncode} (bundle.log)')
+    zips = list((project / '.labelle').glob('*_ios/zig-out/bundle/ios/*-simulator.zip'))
+    if len(zips) != 1:
+        fail(f'expected one simulator zip, found {zips}')
+    import zipfile
+    with zipfile.ZipFile(zips[0]) as z:
+        plist = next(n for n in z.namelist() if n.endswith('.app/Info.plist'))
+        if '<key>CFBundleVersion</key>\n    <string>3</string>' not in z.read(plist).decode():
+            fail('the bundled Info.plist does not carry CFBundleVersion 3')
+        summary['bundle'] = {'zip': zips[0].name, 'entries': len(z.namelist())}
+    sh(['xcrun', 'simctl', 'delete', created], env, check=False)
     summary['result'] = 'ok'
     (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))

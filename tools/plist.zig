@@ -23,6 +23,8 @@ pub const Info = struct {
     /// `CFBundleIconFiles` base name (e.g. `AppIcon60x60`), when the bundle
     /// carries icon PNGs.
     icon: ?[]const u8 = null,
+    /// `CFBundleVersion`: `labelle bundle --build-number`, else 1.
+    version: u32 = 1,
 };
 
 /// The complete `Info.plist` document. Caller owns the result.
@@ -52,7 +54,7 @@ pub fn infoPlist(a: std.mem.Allocator, info: Info) ![]u8 {
     try string(w, "CFBundlePackageType", "APPL");
     try string(w, "CFBundleShortVersionString", "1.0");
     try w.writeAll("    <key>CFBundleSupportedPlatforms</key>\n    <array>\n        <string>iPhoneSimulator</string>\n    </array>\n");
-    try string(w, "CFBundleVersion", "1");
+    try w.print("    <key>CFBundleVersion</key>\n    <string>{d}</string>\n", .{info.version});
     try boolean(w, "LSRequiresIPhoneOS", true);
     try string(w, "MinimumOSVersion", info.minimum_ios);
     try w.writeAll("    <key>UIDeviceFamily</key>\n    <array>\n");
@@ -202,4 +204,16 @@ test "text is XML-escaped" {
     defer a.free(plist);
     try expectContains(plist, "<string>Cats &amp; &lt;Dogs&gt;</string>");
     try std.testing.expect(std.mem.indexOf(u8, plist, "Cats & ") == null);
+}
+
+test "CFBundleVersion is the build number" {
+    const a = std.testing.allocator;
+    const one = try infoPlist(a, base);
+    defer a.free(one);
+    try expectContains(one, "<key>CFBundleVersion</key>\n    <string>1</string>");
+    var info = base;
+    info.version = 42;
+    const stamped = try infoPlist(a, info);
+    defer a.free(stamped);
+    try expectContains(stamped, "<key>CFBundleVersion</key>\n    <string>42</string>");
 }
