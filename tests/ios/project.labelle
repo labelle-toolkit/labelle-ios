@@ -1,0 +1,18 @@
+// The real-simulator fixture (RFC labelle-cli#471 I1): labelle-sokol's
+// `test/ios` fixture (v0.8.1), with the backend pinned to the sokol v0.8.1
+// release and this checkout pinned as the `ios` provider (`local:../..`).
+// `tests/ios/sim_e2e.py` builds it with `labelle build --platform=ios` and runs
+// it on a simulator with `labelle run --platform=ios --timeout=...`.
+.{
+    .name = "ios_sim_fixture", .title = "iOS Sim Fixture",
+    .width = 800, .height = 600, .target_fps = 60,
+    .backend = .sokol,
+    .backend_package = .{ .name = "sokol", .repo = "github.com/labelle-toolkit/labelle-sokol", .version = "0.8.1" },
+    .gamepad = .none, .ecs = .mock, .y_axis = .up,
+    .initial_prefab = "main", .states = .{"playing"},
+    .layers = .{ .{ .name = "hud", .order = 0, .space = .screen } },
+    .core_version = "2.1.0", .engine_version = "3.4.1", .gfx_version = "2.2.0",
+    .assembler_version = "0.117.1",
+    .plugins = .{ .{ .name = "ios", .repo = "local:../.." } },
+    .provider_config = .{ .{ .package = "ios", .file = "providers/ios.json" } },
+}
