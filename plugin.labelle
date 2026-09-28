@@ -1,0 +1,33 @@
+// labelle-ios package manifest (manifest v2, labelle-cli provider contract):
+// the `ios` target provider (RFC labelle-cli#471 I1).
+//
+// `.name = "ios"` because the assembler derives a plugin's module alias as
+// `labelle_<name>`, and this package's one module is `labelle_ios` (the name
+// its `build.zig.zon` declares). The `.plugins` entry, the registry package
+// and `.provider_config .package` must all use this name.
+//
+// No `.namespace` and no commands yet: the CLI still reserves the `ios`
+// namespace for its legacy `labelle ios` subcommand until RFC #471 I5. The
+// provider works through the target hooks only, behind
+// `labelle build|run|bundle --platform=ios`:
+//   - `app` after `build`: wraps the core build's executable into
+//     `zig-out/ios/<AppName>.app` (Info.plist, launch screen, icon);
+//   - `launch` replacing `run`: boots a simulator, installs that app and runs
+//     it with `simctl launch --console-pty`, blocking until the app exits;
+//   - `bundle` replacing `bundle`: zips the simulator `.app`.
+//
+// Every hook runs the one host tool `bin/labelle-ios` (`tools/main.zig`, built
+// by `zig build install-provider`). `command_contract` admits exactly the wire
+// versions its strict decoder (`tools/contract.zig`) accepts from 1.3.0 on:
+// the 1.4.0 minor is not admitted until the decoder learns it.
+.{
+    .name = "ios",
+    .manifest_version = 2,
+    .command_contract = ">=1.3.0 <1.4.0",
+    .targets = .{"ios"},
+    .hooks = .{
+        .{ .id = "app", .step = .build, .target = "ios", .when = .after, .build_step = "install-provider", .executable = "bin/labelle-ios" },
+        .{ .id = "launch", .step = .run, .target = "ios", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-ios" },
+        .{ .id = "bundle", .step = .bundle, .target = "ios", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-ios" },
+    },
+}

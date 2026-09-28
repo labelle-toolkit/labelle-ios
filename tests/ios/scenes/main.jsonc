@@ -1,0 +1,16 @@
+{
+    "name": "main",
+    "children": [
+        {
+            "name": "rect",
+            "components": {
+                "Position": { "x": 400, "y": 300 },
+                "Shape": {
+                    "shape": { "rectangle": { "width": 160, "height": 160 } },
+                    "color": { "r": 230, "g": 30, "b": 200, "a": 255 },
+                    "layer": "hud"
+                }
+            }
+        }
+    ]
+}

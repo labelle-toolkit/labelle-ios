@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "app_name": "iOS Sim Fixture",
+  "bundle_id": "com.labelle.ios-sim-fixture",
+  "orientation": "landscape",
+  "simulator": { "device": null },
+  "destination": "simulator"
+}

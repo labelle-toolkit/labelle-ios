@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: zig fmt --check
+        run: zig fmt --check .
+      # The provider host tool: the vendored contract 1.3.0 decoder and its
+      # fixtures, providers/ios.json, Info.plist, simctl parsing and device
+      # choice, executable discovery, the .app layout, the zip writer and the
+      # launch supervision (POSIX).
+      - name: Build and test the provider tool
+        run: zig build install-provider test --summary all
+      # labelle-cli#446: the built tool's stdout+stderr redirected to one FILE
+      # the "CLI" already wrote to must append, not overwrite from offset 0.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Redirected stdio appends (labelle-cli#446)
+        shell: bash
+        run: |
+          tool=zig-out/bin/labelle-ios
+          if [ "$RUNNER_OS" = Windows ]; then tool="$tool.exe"; fi
+          python tests/provider/stdio_e2e.py --tool "$tool"
+
+  # The provider through the real labelle-cli, on every host: discovery from a
+  # fixture project's `local:` pin, the `zig build --system install-provider`
+  # build, the contract 1.3.0 context, and the three hooks behind
+  # `labelle build|run|bundle --platform=ios` against a fake assembler and a
+  # fake `xcrun`/`codesign` that log their argv (tests/provider/e2e.py). On
+  # Windows the launch hook must refuse (the simulator needs macOS).
+  provider:
+    name: Provider e2e, fake xcrun (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # labelle-cli `main` at the merge of #467 (RFC #466 A1): contract 1.3.0.
+      # It still has the legacy iOS code; a provider's `replace run` wins over
+      # it (RFC #471 §0 finding 1).
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: e2e0e85e7dd8ae3015bb5bcaf2e0b77af1917fd5
+          path: .test-cli
+          persist-credentials: false
+      - run: zig build -Dversion=2.1.0-dev
+        working-directory: .test-cli
+      - name: Exercise discovery, the app hook, launch and bundle
+        shell: bash
+        run: |
+          zig_bin="$(command -v zig)"
+          cli_bin=.test-cli/zig-out/bin/labelle
+          if [ "$RUNNER_OS" = Windows ]; then
+            zig_bin="$(cygpath -w "$zig_bin")"
+            cli_bin="$cli_bin.exe"
+          fi
+          python tests/provider/e2e.py --cli "$cli_bin" --zig "$zig_bin"
+
+  # A real sokol app on a real iOS simulator: the pinned CLI, the released
+  # assembler (0.117.1) and sokol backend (v0.8.1) build tests/ios with a clean
+  # HOME; this provider wraps the .app, boots a simulator, installs and runs it
+  # (`simctl launch --console-pty`) until `--timeout` stops it. Asserts the
+  # fixture's log lines and a non-blank screenshot showing its rectangle
+  # (tests/ios/sim_e2e.py).
+  simulator:
+    name: Real iOS simulator (sokol fixture)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Show the Xcode toolchain and simulator runtimes
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-path
+          xcrun simctl list runtimes
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: e2e0e85e7dd8ae3015bb5bcaf2e0b77af1917fd5
+          path: .test-cli
+          persist-credentials: false
+      - run: zig build -Dversion=2.1.0-dev
+        working-directory: .test-cli
+      - name: Build, launch, screenshot
+        run: python tests/ios/sim_e2e.py --cli .test-cli/zig-out/bin/labelle --out "$RUNNER_TEMP/sim"
+      - name: Upload the run log and screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-run
+          path: ${{ runner.temp }}/sim
+          if-no-files-found: warn
