@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shutil
 import struct
@@ -272,7 +273,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-sim-') as temp:
     import zipfile
     with zipfile.ZipFile(zips[0]) as z:
         plist = next(n for n in z.namelist() if n.endswith('.app/Info.plist'))
-        if '<key>CFBundleVersion</key>\n    <string>3</string>' not in z.read(plist).decode():
+        if plistlib.loads(z.read(plist)).get('CFBundleVersion') != '3':
             fail('the bundled Info.plist does not carry CFBundleVersion 3')
         summary['bundle'] = {'zip': zips[0].name, 'entries': len(z.namelist())}
     sh(['xcrun', 'simctl', 'delete', created], env, check=False)

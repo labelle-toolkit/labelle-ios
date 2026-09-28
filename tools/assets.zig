@@ -25,8 +25,16 @@ pub const Error = error{
 /// '/'-separated path under `assets_dir` and `path` the file to read (the
 /// link target for a linked file). `project_dir` bounds where links may go.
 pub fn walk(a: std.mem.Allocator, io: std.Io, project_dir: []const u8, assets_dir: []const u8, visitor: anytype) !void {
-    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, project_dir, a);
-    try walkDir(a, io, root, assets_dir, "", 0, visitor);
+    const cwd = std.Io.Dir.cwd();
+    const root = try cwd.realPathFileAlloc(io, project_dir, a);
+    // The root too: `assets` itself, or a directory above it, may be a link.
+    // Walk from the resolved path, so every entry is bounded by the check.
+    const real = try cwd.realPathFileAlloc(io, assets_dir, a);
+    if (!inside(root, real)) {
+        std.debug.print("labelle-ios: {s} resolves to {s}, outside the project {s}: keep the assets inside the project\n", .{ assets_dir, real, root });
+        return error.AssetLinkOutsideProject;
+    }
+    try walkDir(a, io, root, real, "", 0, visitor);
 }
 
 const Item = struct { name: []const u8, kind: std.Io.File.Kind };
@@ -161,4 +169,38 @@ test "walk: a link outside the project, a dangling link and a cycle are refused"
 
     try tmp.dir.symLink(io, ".", "project/assets/loop", .{});
     try std.testing.expectError(error.AssetTreeTooDeep, walk(a, io, project, assets, &r));
+}
+
+test "walk: an assets root, or a parent of it, linked outside the project is refused" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "project/target");
+    try tmp.dir.createDirPath(io, "project/shared/assets");
+    try tmp.dir.createDirPath(io, "elsewhere/tgt/assets");
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/tgt/assets/secret.txt", .data = "SECRET" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "project/shared/assets/ok.txt", .data = "OK" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const project = try std.fs.path.join(a, &.{ root, "project" });
+    var r: Recorder = .{ .a = a };
+
+    // `assets` itself links outside.
+    try tmp.dir.symLink(io, "../../elsewhere/tgt/assets", "project/target/assets", .{});
+    try std.testing.expectError(error.AssetLinkOutsideProject, walk(a, io, project, try std.fs.path.join(a, &.{ project, "target/assets" }), &r));
+    try tmp.dir.deleteFile(io, "project/target/assets");
+
+    // A parent of it links outside.
+    try tmp.dir.symLink(io, "../elsewhere/tgt", "project/linked", .{});
+    try std.testing.expectError(error.AssetLinkOutsideProject, walk(a, io, project, try std.fs.path.join(a, &.{ project, "linked/assets" }), &r));
+    try std.testing.expectEqual(@as(usize, 0), r.seen.items.len);
+
+    // `assets` linked inside the project is walked.
+    try tmp.dir.symLink(io, "../shared/assets", "project/target/assets", .{});
+    try walk(a, io, project, try std.fs.path.join(a, &.{ project, "target/assets" }), &r);
+    try std.testing.expectEqual(@as(usize, 1), r.seen.items.len);
+    try std.testing.expectEqualStrings("ok.txt=OK", r.seen.items[0]);
 }

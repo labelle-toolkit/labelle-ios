@@ -36,20 +36,41 @@ pub const Entry = struct {
     dir: bool,
 };
 
+pub const ListOptions = struct {
+    /// Test seam: report every entry's kind as `.unknown`, as NFS, FUSE and
+    /// some mounted CI workspaces do, so the stat fallback is exercised.
+    report_unknown_kinds: bool = false,
+};
+
 /// Every entry under `root`, sorted by path ('/'-separated), directories
-/// included. Symlinks and other special files are refused: an `.app` built
-/// by `app.zig` has none.
-pub fn listTree(a: std.mem.Allocator, io: std.Io, root: []const u8) ![]Entry {
-    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(a);
-    defer walker.deinit();
+/// included. An entry whose kind the directory listing leaves `.unknown` is
+/// resolved with a no-follow stat before deciding. Symlinks and other special
+/// files are refused: an `.app` built by `app.zig` has none.
+pub fn listTree(a: std.mem.Allocator, io: std.Io, root: []const u8, opts: ListOptions) ![]Entry {
     var entries: std.ArrayList(Entry) = .empty;
-    while (try walker.next(io)) |e| {
-        const path = try a.dupe(u8, e.path);
-        std.mem.replaceScalar(u8, path, '\\', '/');
-        switch (e.kind) {
-            .directory => try entries.append(a, .{ .path = path, .dir = true }),
+    try listDir(a, io, root, "", opts, &entries);
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn lessThan(_: void, x: Entry, y: Entry) bool {
+            return std.mem.lessThan(u8, x.path, y.path);
+        }
+    }.lessThan);
+    return entries.items;
+}
+
+fn listDir(a: std.mem.Allocator, io: std.Io, root: []const u8, rel: []const u8, opts: ListOptions, entries: *std.ArrayList(Entry)) !void {
+    const dir_path = if (rel.len == 0) root else try std.fs.path.join(a, &.{ root, rel });
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        const path = if (rel.len == 0) try a.dupe(u8, e.name) else try std.fmt.allocPrint(a, "{s}/{s}", .{ rel, e.name });
+        const listed: std.Io.File.Kind = if (opts.report_unknown_kinds) .unknown else e.kind;
+        const kind = if (listed == .unknown) (try dir.statFile(io, e.name, .{ .follow_symlinks = false })).kind else listed;
+        switch (kind) {
+            .directory => {
+                try entries.append(a, .{ .path = path, .dir = true });
+                try listDir(a, io, root, path, opts, entries);
+            },
             .file => try entries.append(a, .{ .path = path, .dir = false }),
             else => {
                 std.debug.print("labelle-ios: cannot zip '{s}': only regular files and directories are bundled\n", .{path});
@@ -57,12 +78,6 @@ pub fn listTree(a: std.mem.Allocator, io: std.Io, root: []const u8) ![]Entry {
             },
         }
     }
-    std.mem.sort(Entry, entries.items, {}, struct {
-        fn lessThan(_: void, x: Entry, y: Entry) bool {
-            return std.mem.lessThan(u8, x.path, y.path);
-        }
-    }.lessThan);
-    return entries.items;
 }
 
 /// Zip the tree at `root` into `out_path`, each entry named
@@ -76,10 +91,11 @@ pub fn zipTree(a: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []con
 /// Test seam: runs between a file's checksum pass and its copy pass.
 pub const Hooks = struct {
     between_passes: ?struct { ctx: *anyopaque, run: *const fn (*anyopaque, []const u8) anyerror!void } = null,
+    list: ListOptions = .{},
 };
 
 pub fn zipTreeHooked(a: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []const u8, executables: []const []const u8, out_path: []const u8, hooks: Hooks) !void {
-    const entries = try listTree(a, io, root);
+    const entries = try listTree(a, io, root, hooks.list);
     if (entries.len + 1 > std.math.maxInt(u16)) return error.TooManyZipEntries;
 
     var out = try std.Io.Dir.cwd().createFile(io, out_path, .{});
@@ -375,4 +391,41 @@ test "zipTree: a file rewritten at the same length between the passes fails the 
     }));
     // Without a rewrite the same tree zips.
     try zipTree(a, io, try std.fs.path.join(a, &.{ base, "X.app" }), "X.app", &.{}, try std.fs.path.join(a, &.{ base, "y.zip" }));
+}
+
+test "zipTree: entries listed as .unknown are resolved by a stat, not rejected" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "U.app/assets/deep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "U.app/game", .data = "EXE" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "U.app/assets/deep/x.txt", .data = "X" });
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const root = try std.fs.path.join(a, &.{ base, "U.app" });
+    const known = try listTree(a, io, root, .{});
+    const unknown = try listTree(a, io, root, .{ .report_unknown_kinds = true });
+    try std.testing.expectEqual(@as(usize, 4), known.len);
+    try std.testing.expectEqual(known.len, unknown.len);
+    for (known, unknown) |k, u| {
+        try std.testing.expectEqualStrings(k.path, u.path);
+        try std.testing.expectEqual(k.dir, u.dir);
+    }
+    // The whole archive is the same either way.
+    const one = try std.fs.path.join(a, &.{ base, "known.zip" });
+    const two = try std.fs.path.join(a, &.{ base, "unknown.zip" });
+    try zipTree(a, io, root, "U.app", &.{"game"}, one);
+    try zipTreeHooked(a, io, root, "U.app", &.{"game"}, two, .{ .list = .{ .report_unknown_kinds = true } });
+    try std.testing.expectEqualSlices(
+        u8,
+        try std.Io.Dir.cwd().readFileAlloc(io, one, a, .limited(1 << 20)),
+        try std.Io.Dir.cwd().readFileAlloc(io, two, a, .limited(1 << 20)),
+    );
+    // A real special file (a symlink) is still refused, listed or stat'ed.
+    if (@import("builtin").os.tag != .windows) {
+        try tmp.dir.symLink(io, "game", "U.app/link", .{});
+        try std.testing.expectError(error.UnsupportedFileKind, listTree(a, io, root, .{ .report_unknown_kinds = true }));
+    }
 }

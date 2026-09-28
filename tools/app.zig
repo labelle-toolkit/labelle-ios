@@ -124,7 +124,12 @@ pub fn inputsDigest(a: std.mem.Allocator, io: std.Io, in: Inputs) ![]const u8 {
     part(&h, "app_name", try resolvedAppName(in));
     if (try iconPath(a, in)) |path| {
         part(&h, "icon_path", path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 * 1024 * 1024)) catch |err| @errorName(err);
+        // A read failure is the hook's failure, with its real reason: never
+        // hashed as a stand-in, which would surface as a misleading "stale".
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 * 1024 * 1024)) catch |err| {
+            std.debug.print("labelle-ios: app_icon '{s}' cannot be read: {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
         part(&h, "icon", bytes);
     }
     // Every shipped asset by path, size and content, through the same walk
@@ -745,4 +750,28 @@ test "make: a project title Windows reserves is not used as the app name" {
     }
     in.identity.title = "Console";
     _ = try make(a, io, in);
+}
+
+test "an unreadable icon fails with its real error, never as a stale app" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try Fixture.init(a);
+    defer f.tmp.cleanup();
+    const in = try f.inputs(a, test_settings);
+    _ = try make(a, io, in);
+    _ = try built(a, io, in);
+    // The icon disappears after the app was made: `built` reports the read
+    // error itself, not "made with other settings".
+    try f.tmp.dir.deleteFile(io, "icon.png");
+    try std.testing.expectError(error.FileNotFound, built(a, io, in));
+    try std.testing.expectError(error.FileNotFound, inputsDigest(a, io, in));
+    try std.testing.expectError(error.FileNotFound, make(a, io, in));
+    // A directory where the icon should be: its own read error too (IsDir
+    // on POSIX; Windows names it differently), never a digest.
+    try f.tmp.dir.createDirPath(io, "icon.png");
+    if (inputsDigest(a, io, in)) |_| return error.TestUnexpectedResult else |err| {
+        if (builtin.os.tag != .windows) try std.testing.expectEqual(error.IsDir, err);
+    }
 }

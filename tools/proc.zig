@@ -48,7 +48,14 @@ pub fn findOnPath(a: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
             const file = try std.fmt.allocPrint(a, "{s}{s}", .{ name, suffix });
             const candidate = try std.fs.path.join(a, &.{ dir, file });
             const stat = std.Io.Dir.cwd().statFile(io, candidate, .{}) catch continue;
-            if (stat.kind == .file) return candidate;
+            if (stat.kind != .file) continue;
+            // As a shell does: a match it may not execute is passed over, so
+            // a later PATH entry can still supply the tool. (Windows decides
+            // by the suffix above, PATHEXT-style.)
+            if (builtin.os.tag != .windows) {
+                std.Io.Dir.cwd().access(io, candidate, .{ .execute = true }) catch continue;
+            }
+            return candidate;
         }
     }
     return null;
@@ -85,11 +92,32 @@ test "findOnPath: the first PATH directory that has it; none is null" {
     const name = if (builtin.os.tag == .windows) "xcrun.exe" else "xcrun";
     try tmp.dir.createDirPath(io, "one");
     try tmp.dir.createDirPath(io, "two");
-    try tmp.dir.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ "two", name }), .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ "two", name }), .data = "", .flags = .{ .permissions = .executable_file } });
     var env = std.process.Environ.Map.init(a);
     try std.testing.expect(try findOnPath(a, io, &env, "xcrun") == null);
     const joined = try std.mem.join(a, &[_]u8{std.fs.path.delimiter}, &.{ try std.fs.path.join(a, &.{ root, "one" }), try std.fs.path.join(a, &.{ root, "two" }) });
     try env.put("PATH", joined);
     try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ root, "two", name }), (try findOnPath(a, io, &env, "xcrun")).?);
     try std.testing.expect(try findOnPath(a, io, &env, "codesign") == null);
+}
+
+test "findOnPath: a non-executable match earlier in PATH is passed over" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // no execute bit
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try tmp.dir.createDirPath(io, "early");
+    try tmp.dir.createDirPath(io, "late");
+    try tmp.dir.writeFile(io, .{ .sub_path = "early/xcrun", .data = "not executable" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "late/xcrun", .data = "", .flags = .{ .permissions = .executable_file } });
+    var env = std.process.Environ.Map.init(a);
+    try env.put("PATH", try std.mem.join(a, ":", &.{ try std.fs.path.join(a, &.{ root, "early" }), try std.fs.path.join(a, &.{ root, "late" }) }));
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ root, "late", "xcrun" }), (try findOnPath(a, io, &env, "xcrun")).?);
+    // Only the non-executable one: none.
+    try env.put("PATH", try std.fs.path.join(a, &.{ root, "early" }));
+    try std.testing.expect(try findOnPath(a, io, &env, "xcrun") == null);
 }
