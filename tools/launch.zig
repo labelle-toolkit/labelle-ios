@@ -18,6 +18,7 @@ const simctl = @import("simctl.zig");
 const app_mod = @import("app.zig");
 const settings_mod = @import("settings.zig");
 const proc = @import("proc.zig");
+const devicectl = @import("devicectl.zig");
 
 pub const Inputs = struct {
     /// What the `app` hook made the app from; `app_mod.built` checks it.
@@ -26,20 +27,62 @@ pub const Inputs = struct {
 };
 
 pub const not_macos_message = "the iOS simulator requires macOS (Xcode's simctl); this host cannot run it";
+pub const device_not_macos_message = "running on an iOS device requires macOS (Xcode's devicectl); this host cannot run it";
 
-/// Returns the exit status `labelle run` should end with.
+/// The `launch` hook. Returns the exit status `labelle run` should end with.
+/// A `--timeout` stop is reported through `run.outcome_file` (wire 1.5.0+),
+/// so the CLI skips the after-run hooks as its own watchdog would.
 pub fn launchHook(a: std.mem.Allocator, io: std.Io, in: Inputs) !u8 {
+    const args = simctl.parseRunArgs(a, in.run.args) catch {
+        std.debug.print("labelle-ios: --device needs a simulator or device UDID or name (labelle run --platform=ios -- --device=<udid>)\n", .{});
+        return error.InvalidRunArguments;
+    };
+    const result = try launchApp(a, io, .{
+        .app = in.app,
+        .env = in.run.env,
+        .timeout_ms = in.run.timeout_ms,
+        .device = args.device,
+        .app_args = args.app_args,
+    });
+    if (result.outcome == .timed_out) if (in.run.outcome_file) |path| {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = outcome_timeout });
+    };
+    return result.status;
+}
+
+/// What a `--timeout` stop writes to `run.outcome_file` (contract 1.5.0).
+pub const outcome_timeout = "timeout\n";
+
+/// One launch of the built app, from the `launch` hook or `labelle ios run`.
+pub const Launch = struct {
+    app: app_mod.Inputs,
+    /// Run options, handed to the app as its environment.
+    env: []const contract.RunEnv = &.{},
+    timeout_ms: ?u64 = null,
+    /// `--device=<udid|name>`: a simulator, or a physical device for a
+    /// device build.
+    device: ?[]const u8 = null,
+    app_args: []const []const u8 = &.{},
+};
+
+/// Install the built app and run it in the foreground: on a simulator
+/// (`simctl`) for a simulator build, on a connected device (`devicectl`) for
+/// a device build.
+pub fn launchApp(a: std.mem.Allocator, io: std.Io, l: Launch) !Result {
+    const built = try app_mod.built(a, io, l.app);
+    return switch (built.record.destination) {
+        .simulator => launchSimulator(a, io, l, built),
+        .device => launchDevice(a, io, l, built),
+    };
+}
+
+fn launchSimulator(a: std.mem.Allocator, io: std.Io, l: Launch, built: app_mod.Built) !Result {
     if (builtin.os.tag == .windows) {
         std.debug.print("labelle-ios: {s}\n", .{not_macos_message});
         return error.SimulatorNeedsMacos;
     }
-    const built = try app_mod.built(a, io, in.app);
-    const settings = in.app.settings;
-    const env_map = in.app.env;
-    const args = simctl.parseRunArgs(a, in.run.args) catch {
-        std.debug.print("labelle-ios: --device needs a simulator UDID or name (labelle run --platform=ios -- --device=<udid>)\n", .{});
-        return error.InvalidRunArguments;
-    };
+    const settings = l.app.settings;
+    const env_map = l.app.env;
     const xcrun = (try proc.findOnPath(a, io, env_map, "xcrun")) orelse {
         std.debug.print("labelle-ios: xcrun not found on PATH: {s}\n", .{not_macos_message});
         return error.XcrunNotFound;
@@ -54,9 +97,9 @@ pub fn launchHook(a: std.mem.Allocator, io: std.Io, in: Inputs) !u8 {
         std.debug.print("labelle-ios: `xcrun simctl list -j devices available` printed something that is not a device list:\n{s}\n", .{listed});
         return error.InvalidSimctlOutput;
     };
-    // `-- --device=` beats the settings' `simulator.device`: the one-off
+    // `--device=` beats the settings' `simulator.device`: the one-off
     // choice on the command line overrides the project's default.
-    const want = args.device orelse settings.simulator.device;
+    const want = l.device orelse settings.simulator.device;
     // Automatic choice: a device of the app's family on a runtime that meets
     // `minimum_ios`, or `simctl install` would refuse it.
     const need: simctl.Need = .{
@@ -84,23 +127,67 @@ pub fn launchHook(a: std.mem.Allocator, io: std.Io, in: Inputs) !u8 {
     std.debug.print("labelle-ios: installing {s}...\n", .{std.fs.path.basename(built.path)});
     _ = try runChecked(a, io, &.{ xcrun, "simctl", "install", device.udid, built.path }, "install the app");
 
-    var env = try simctl.launchEnv(a, env_map, in.run.env);
-    for (in.run.env) |kv| std.debug.print("labelle-ios: launch environment {s}={s}\n", .{ kv.name, kv.value });
-    const argv = try simctl.launchArgv(a, xcrun, device.udid, settings.bundle_id, args.app_args);
+    var env = try simctl.launchEnv(a, env_map, l.env);
+    for (l.env) |kv| std.debug.print("labelle-ios: launch environment {s}={s}\n", .{ kv.name, kv.value });
+    const argv = try simctl.launchArgv(a, xcrun, device.udid, settings.bundle_id, l.app_args);
     std.debug.print("labelle-ios: launching {s} (the app's output follows)\n", .{settings.bundle_id});
     const result = try supervise(a, io, .{
         .argv = argv,
         .env = &env,
-        .timeout_ms = in.run.timeout_ms,
+        .timeout_ms = l.timeout_ms,
         .terminate_argv = &.{ xcrun, "simctl", "terminate", device.udid, settings.bundle_id },
     });
+    report(result);
+    return result;
+}
+
+fn report(result: Result) void {
     switch (result.outcome) {
         .exited => std.debug.print("labelle-ios: the app exited (status {d})\n", .{result.status}),
         .timed_out => std.debug.print("labelle-ios: stopped the app after --timeout\n", .{}),
         .interrupted => std.debug.print("labelle-ios: stopped the app on a termination signal\n", .{}),
         .stop_failed => {},
     }
-    return result.status;
+}
+
+/// A device build: install on a connected device with `devicectl` and run
+/// it with `--console` until it exits. Stopping (`--timeout`, a signal)
+/// interrupts the `devicectl` client, which ends the console session.
+fn launchDevice(a: std.mem.Allocator, io: std.Io, l: Launch, built: app_mod.Built) !Result {
+    if (builtin.os.tag != .macos) {
+        std.debug.print("labelle-ios: {s}\n", .{device_not_macos_message});
+        return error.DeviceNeedsMacos;
+    }
+    const settings = l.app.settings;
+    const xcrun = (try proc.findOnPath(a, io, l.app.env, "xcrun")) orelse {
+        std.debug.print("labelle-ios: xcrun not found on PATH: {s}\n", .{device_not_macos_message});
+        return error.XcrunNotFound;
+    };
+    if (!devicectl.available(a, io, xcrun)) {
+        std.debug.print("labelle-ios: this Xcode has no devicectl (Xcode 15 or newer runs apps on devices from the command line); open the project with `labelle ios xcode` instead\n", .{});
+        return error.DevicectlNotFound;
+    }
+    const json_out = try std.fs.path.join(a, &.{ l.app.target_dir, "zig-out", "ios-devices.json" });
+    const devices = try devicectl.list(a, io, xcrun, json_out);
+    const device = devicectl.pick(devices, l.device) catch |err| {
+        switch (err) {
+            error.NoSuchDevice => std.debug.print("labelle-ios: no iOS device matches '{s}'. Devices:\n", .{l.device.?}),
+            error.NoDevice => std.debug.print("labelle-ios: no connected, paired iOS device (connect one, trust this Mac and enable Developer Mode). Devices:\n", .{}),
+            error.SeveralDevices => std.debug.print("labelle-ios: several iOS devices are connected; pick one with --device=<id>:\n", .{}),
+        }
+        for (devices) |d| std.debug.print("  {s}  {s} ({s}, iOS {s}, {s})\n", .{ d.identifier, d.name, d.model orelse "?", d.os_version orelse "?", d.state() });
+        if (devices.len == 0) std.debug.print("  (none)\n", .{});
+        return err;
+    };
+    std.debug.print("labelle-ios: device {s} ({s}, iOS {s}, {s})\n", .{ device.name, device.identifier, device.os_version orelse "?", device.state() });
+    std.debug.print("labelle-ios: installing {s}...\n", .{std.fs.path.basename(built.path)});
+    _ = try runChecked(a, io, try devicectl.installArgv(a, xcrun, device.identifier, built.path), "install the app on the device");
+    for (l.env) |kv| std.debug.print("labelle-ios: launch environment {s}={s}\n", .{ kv.name, kv.value });
+    const argv = try devicectl.launchArgv(a, xcrun, device.identifier, settings.bundle_id, l.env, l.app_args);
+    std.debug.print("labelle-ios: launching {s} (the app's output follows)\n", .{settings.bundle_id});
+    const result = try supervise(a, io, .{ .argv = argv, .timeout_ms = l.timeout_ms, .terminate_argv = null });
+    report(result);
+    return result;
 }
 
 /// Run a simctl step to completion; its stdout on success, else the step's
@@ -124,7 +211,9 @@ pub const Supervise = struct {
     env: ?*const std.process.Environ.Map = null,
     timeout_ms: ?u64 = null,
     /// Asks the app to stop (`simctl terminate`); the launch then returns.
-    terminate_argv: []const []const u8,
+    /// Null: the launch client itself is interrupted (SIGINT), as for
+    /// `devicectl --console`, whose session ends with it.
+    terminate_argv: ?[]const []const u8,
     /// How long the launch may take to return after `terminate_argv`.
     grace_ms: u64 = 15_000,
 };
@@ -212,7 +301,9 @@ fn supervisePosix(a: std.mem.Allocator, io: std.Io, s: Supervise) !Result {
             // The launch ended with the user's stop: `simctl` passes the
             // signal to the app, but make sure nothing is left running.
             // "Nothing to terminate" is the expected answer, so it is quiet.
-            if (done.outcome == .interrupted) _ = proc.run(a, io, s.terminate_argv, .{}) catch {};
+            if (done.outcome == .interrupted) if (s.terminate_argv) |t| {
+                _ = proc.run(a, io, t, .{}) catch {};
+            };
             return done;
         }
         if (signalled) break .interrupted;
@@ -229,17 +320,29 @@ fn supervisePosix(a: std.mem.Allocator, io: std.Io, s: Supervise) !Result {
 /// terminate with the launch still running is reported, not hidden: the app
 /// may still run, so the result is `stop_failed` (status 1).
 fn stop(a: std.mem.Allocator, io: std.Io, pid: std.posix.pid_t, s: Supervise, outcome: Outcome) !Result {
+    const terminate_argv = s.terminate_argv orelse {
+        // No separate stop command: interrupt the client, as Ctrl-C would.
+        std.posix.kill(pid, .INT) catch {};
+        if (pollUntil(io, pid, s.grace_ms) != null) return .{ .status = 0, .outcome = outcome };
+        std.posix.kill(pid, .TERM) catch {};
+        if (pollUntil(io, pid, 3_000) == null) {
+            std.posix.kill(pid, .KILL) catch {};
+            var status: c_int = 0;
+            _ = std.c.waitpid(pid, &status, 0);
+        }
+        return .{ .status = 0, .outcome = outcome };
+    };
     var attempt: usize = 0;
     const terminated = while (attempt < 2) : (attempt += 1) {
         if (attempt > 0) {
             // Ended on its own since the first attempt: nothing left to stop.
             if (pollUntil(io, pid, 1_000) != null) return .{ .status = 0, .outcome = outcome };
-            std.debug.print("labelle-ios: retrying `{s}`\n", .{try std.mem.join(a, " ", s.terminate_argv[1..])});
+            std.debug.print("labelle-ios: retrying `{s}`\n", .{try std.mem.join(a, " ", terminate_argv[1..])});
         }
-        if (proc.run(a, io, s.terminate_argv, .{})) |r| {
+        if (proc.run(a, io, terminate_argv, .{})) |r| {
             if (proc.succeeded(r.term)) break true;
-            std.debug.print("labelle-ios: `{s}` exited {d}: {s}{s}", .{ try std.mem.join(a, " ", s.terminate_argv[1..]), proc.status(r.term), r.stdout, r.stderr });
-        } else |err| std.debug.print("labelle-ios: could not run {s}: {s}\n", .{ s.terminate_argv[0], @errorName(err) });
+            std.debug.print("labelle-ios: `{s}` exited {d}: {s}{s}", .{ try std.mem.join(a, " ", terminate_argv[1..]), proc.status(r.term), r.stdout, r.stderr });
+        } else |err| std.debug.print("labelle-ios: could not run {s}: {s}\n", .{ terminate_argv[0], @errorName(err) });
     } else false;
     if (pollUntil(io, pid, if (terminated) s.grace_ms else 1_000) != null) return .{ .status = 0, .outcome = outcome };
     // The local `simctl launch` client is still there: end it.
@@ -250,7 +353,7 @@ fn stop(a: std.mem.Allocator, io: std.Io, pid: std.posix.pid_t, s: Supervise, ou
         _ = std.c.waitpid(pid, &status, 0);
     }
     if (terminated) return .{ .status = 0, .outcome = outcome };
-    std.debug.print("labelle-ios: could not stop the app on the simulator: `simctl terminate` failed twice; it may still be running (stop it from the simulator, or `xcrun {s}`)\n", .{try std.mem.join(a, " ", s.terminate_argv[1..])});
+    std.debug.print("labelle-ios: could not stop the app on the simulator: `simctl terminate` failed twice; it may still be running (stop it from the simulator, or `xcrun {s}`)\n", .{try std.mem.join(a, " ", terminate_argv[1..])});
     return .{ .status = 1, .outcome = .stop_failed };
 }
 
@@ -397,4 +500,28 @@ test "supervise: terminate failing while the app ends on its own is still a clea
     });
     try std.testing.expectEqual(Outcome.timed_out, r.outcome);
     try std.testing.expectEqual(@as(u8, 0), r.status);
+}
+
+test "supervise: with no terminate command the launch client is interrupted (devicectl --console)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const marker = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(std.testing.io, ".", a), "interrupted" });
+    // Like `devicectl --console`: SIGINT ends the session (here: records it
+    // and exits 130).
+    const script = try std.fmt.allocPrint(a, "trap 'touch \"{s}\"; exit 130' INT; while :; do sleep 0.05; done", .{marker});
+    const start = nowMs(std.testing.io);
+    const r = try supervise(a, std.testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", script },
+        .timeout_ms = 200,
+        .terminate_argv = null,
+        .grace_ms = 10_000,
+    });
+    try std.testing.expectEqual(Outcome.timed_out, r.outcome);
+    try std.testing.expectEqual(@as(u8, 0), r.status);
+    try std.testing.expect(nowMs(std.testing.io) - start < 5_000);
+    try tmp.dir.access(std.testing.io, "interrupted", .{});
 }

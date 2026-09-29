@@ -175,6 +175,51 @@ pub fn pick(devices: []const Device, want: ?[]const u8, need: Need) ?Device {
     return best(devices, need, meets);
 }
 
+/// An installed iOS simulator runtime.
+pub const Runtime = struct {
+    identifier: []const u8,
+    /// `iOS 18.2`.
+    name: []const u8,
+    version: [3]u32,
+    available: bool,
+};
+
+/// `xcrun simctl list -j runtimes`.
+pub const runtimes_args = [_][]const u8{ "simctl", "list", "-j", "runtimes" };
+
+/// The iOS runtimes of `simctl list -j runtimes` output (other platforms
+/// dropped), in the listed order. Strings borrow from `a`.
+pub fn parseRuntimes(a: std.mem.Allocator, bytes: []const u8) ![]Runtime {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return error.InvalidSimctlOutput;
+    if (root != .object) return error.InvalidSimctlOutput;
+    const entries = root.object.get("runtimes") orelse return error.InvalidSimctlOutput;
+    if (entries != .array) return error.InvalidSimctlOutput;
+    var found: std.ArrayList(Runtime) = .empty;
+    for (entries.array.items) |item| {
+        if (item != .object) return error.InvalidSimctlOutput;
+        const identifier = try field(item.object, "identifier");
+        const version = iosRuntimeVersion(identifier) orelse continue;
+        const available = if (item.object.get("isAvailable")) |v| v == .bool and v.bool else true;
+        try found.append(a, .{
+            .identifier = identifier,
+            .name = if (item.object.get("name")) |n| (if (n == .string) n.string else identifier) else identifier,
+            .version = version,
+            .available = available,
+        });
+    }
+    return found.items;
+}
+
+/// The newest available runtime at or above `minimum`, if any.
+pub fn newestRuntime(runtimes: []const Runtime, minimum: [3]u32) ?Runtime {
+    var chosen: ?Runtime = null;
+    for (runtimes) |r| {
+        if (!r.available or std.mem.order(u32, &r.version, &minimum) == .lt) continue;
+        if (chosen == null or newer(r.version, chosen.?.version)) chosen = r;
+    }
+    return chosen;
+}
+
 /// What the `launch` hook takes from `labelle run ... -- <args>`: a
 /// `--device=<udid|name>` (or `--device <udid|name>`) choice, and the rest,
 /// forwarded to the app as its arguments.
@@ -408,4 +453,37 @@ test "pick: the automatic choice meets the app's family and minimum iOS" {
     try std.testing.expectEqual(Family.ipad, Family.fromDeviceFamily("2"));
     try std.testing.expectEqual(Family.iphone, Family.fromDeviceFamily("1,2"));
     try std.testing.expectEqual(Family.iphone, Family.fromDeviceFamily("1"));
+}
+
+/// Trimmed `xcrun simctl list -j runtimes` (Xcode 16): two iOS runtimes, one
+/// unavailable, and a watchOS one.
+pub const runtimes_fixture =
+    \\{
+    \\  "runtimes" : [
+    \\    { "bundlePath" : "/x", "buildversion" : "21F79", "platform" : "iOS", "runtimeRoot" : "/y",
+    \\      "identifier" : "com.apple.CoreSimulator.SimRuntime.iOS-17-5", "version" : "17.5", "isInternal" : false,
+    \\      "isAvailable" : true, "name" : "iOS 17.5", "supportedDeviceTypes" : [] },
+    \\    { "identifier" : "com.apple.CoreSimulator.SimRuntime.iOS-18-2", "version" : "18.2", "isAvailable" : true, "name" : "iOS 18.2" },
+    \\    { "identifier" : "com.apple.CoreSimulator.SimRuntime.iOS-16-4", "version" : "16.4", "isAvailable" : false, "name" : "iOS 16.4",
+    \\      "availabilityError" : "runtime profile not found" },
+    \\    { "identifier" : "com.apple.CoreSimulator.SimRuntime.watchOS-11-2", "version" : "11.2", "isAvailable" : true, "name" : "watchOS 11.2" }
+    \\  ]
+    \\}
+;
+
+test "parseRuntimes: iOS only; newestRuntime honours availability and the floor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const runtimes = try parseRuntimes(a, runtimes_fixture);
+    try std.testing.expectEqual(@as(usize, 3), runtimes.len);
+    try std.testing.expectEqualStrings("iOS 17.5", runtimes[0].name);
+    try std.testing.expect(!runtimes[2].available);
+    try std.testing.expectEqualStrings("iOS 18.2", newestRuntime(runtimes, .{ 15, 0, 0 }).?.name);
+    try std.testing.expect(newestRuntime(runtimes, .{ 19, 0, 0 }) == null);
+    try std.testing.expect(newestRuntime(runtimes[2..], .{ 15, 0, 0 }) == null);
+    try std.testing.expectEqual(@as(usize, 0), (try parseRuntimes(a, "{\"runtimes\": []}")).len);
+    for ([_][]const u8{ "", "{}", "{\"runtimes\": {}}", "{\"runtimes\": [{}]}" }) |bad| {
+        try std.testing.expectError(error.InvalidSimctlOutput, parseRuntimes(a, bad));
+    }
 }

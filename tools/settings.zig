@@ -2,6 +2,10 @@
 //! provider through `.provider_config` (RFC labelle-cli#471 I1). It replaces
 //! the CLI's `project.labelle .ios` block.
 //!
+//! v0.2 (I6) extends schema v1 additively: `destination: "device"` is now
+//! accepted, with the optional `signing` block it needs. Every v0.1 file stays
+//! valid and means the same; `schema_version` stays 1.
+//!
 //! The parse is strict: unknown keys, duplicate keys and wrong types are
 //! errors, nested blocks included. Validation runs before any side effect, so
 //! a bad file stops the hook before anything is written or launched.
@@ -30,12 +34,26 @@ pub const Simulator = struct {
     device: ?[]const u8 = null,
 };
 
+/// How a device build is signed (`destination: "device"`; ignored for the
+/// simulator, whose apps are ad-hoc signed).
+pub const Signing = struct {
+    /// The codesigning identity, as `security find-identity -v -p
+    /// codesigning` lists it: its name (`"Apple Development: Jo (ABCDE12345)"`)
+    /// or its 40-hex SHA-1.
+    identity: ?[]const u8 = null,
+    /// The provisioning profile (`.mobileprovision`), relative to the project
+    /// directory or absolute. It must cover `bundle_id`.
+    profile: ?[]const u8 = null,
+};
+
 pub const Settings = struct {
     schema_version: u32,
     bundle_id: []const u8,
     /// Defaults to the project's `.title`.
     app_name: ?[]const u8 = null,
-    /// Apple Developer Team ID: validated now, used by device signing (v0.2).
+    /// Apple Developer Team ID. For a device build, the provisioning
+    /// profile's team must match it; `labelle ios xcode` writes it as
+    /// `DEVELOPMENT_TEAM`.
     team_id: ?[]const u8 = null,
     minimum_ios: []const u8 = "15.0",
     orientation: Orientation = .all,
@@ -43,6 +61,7 @@ pub const Settings = struct {
     device_family: []const u8 = "1,2",
     simulator: Simulator = .{},
     destination: Destination = .simulator,
+    signing: Signing = .{},
 };
 
 pub const Error = error{
@@ -78,11 +97,10 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, diag: *Diagnostic) Error!S
             if (!isField(Simulator, key)) return fail(a, diag, "unknown key 'simulator.{s}'", .{key});
         };
     }
-    // Answered before the typed decode, so the v0.2 value gets its own
-    // message rather than a generic schema error.
-    if (object.get("destination")) |dest| {
-        if (dest == .string and std.mem.eql(u8, dest.string, "device"))
-            return fail(a, diag, "destination \"device\" is not supported yet: device builds arrive in v0.2 (use \"simulator\")", .{});
+    if (object.get("signing")) |block| {
+        if (block == .object) for (block.object.keys()) |key| {
+            if (!isField(Signing, key)) return fail(a, diag, "unknown key 'signing.{s}'", .{key});
+        };
     }
 
     const settings = std.json.parseFromSliceLeaky(Settings, a, bytes, .{
@@ -116,8 +134,19 @@ pub fn validate(a: std.mem.Allocator, s: Settings, diag: *Diagnostic) Error!void
     if (s.simulator.device) |device| {
         if (!displayText(device)) return fail(a, diag, "simulator.device must be a simulator UDID or name", .{});
     }
-    if (s.destination == .device)
-        return fail(a, diag, "destination \"device\" is not supported yet: device builds arrive in v0.2 (use \"simulator\")", .{});
+    if (s.signing.identity) |identity| {
+        if (!displayText(identity)) return fail(a, diag, "signing.identity must be a codesigning identity name or SHA-1", .{});
+    }
+    if (s.signing.profile) |profile| {
+        if (!displayText(profile) or !std.mem.endsWith(u8, profile, ".mobileprovision"))
+            return fail(a, diag, "signing.profile must be the path of a .mobileprovision file", .{});
+    }
+    if (s.destination == .device) {
+        // A device refuses an unsigned or ad-hoc signed app: both are needed
+        // before anything is built.
+        if (s.signing.identity == null or s.signing.profile == null)
+            return fail(a, diag, "destination \"device\" needs \"signing\": {{\"identity\": \"Apple Development: ...\", \"profile\": \"path/to.mobileprovision\"}} (list identities with `security find-identity -v -p codesigning`)", .{});
+    }
 }
 
 /// The name the home screen shows: `app_name`, else the project's title.
@@ -285,8 +314,15 @@ test "every rejection names its reason" {
         .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"simulator\": {\"udid\": \"x\"}}", .reason = "unknown key 'simulator.udid'" },
         .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"simulator\": \"iPhone\"}", .reason = "does not match schema v1" },
         .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"simulator\": {\"device\": \" \"}}", .reason = "simulator.device" },
-        // Destination: simulator only in v0.1.
-        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"destination\": \"device\"}", .reason = "device builds arrive in v0.2" },
+        // Destination: a device build needs both signing inputs.
+        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"destination\": \"device\"}", .reason = "destination \"device\" needs \"signing\"" },
+        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"destination\": \"device\", \"signing\": {\"identity\": \"Apple Development: A\"}}", .reason = "needs \"signing\"" },
+        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"destination\": \"device\", \"signing\": {\"profile\": \"a.mobileprovision\"}}", .reason = "needs \"signing\"" },
+        // Signing is strict too.
+        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"signing\": {\"team\": \"x\"}}", .reason = "unknown key 'signing.team'" },
+        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"signing\": {\"identity\": \" \"}}", .reason = "signing.identity" },
+        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"signing\": {\"profile\": \"a.p12\"}}", .reason = "signing.profile" },
+        .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"signing\": \"auto\"}", .reason = "does not match schema v1" },
         .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"destination\": \"cloud\"}", .reason = "InvalidEnumTag" },
         // Bundle identifier.
         .{ .json = "{\"schema_version\": 1, \"bundle_id\": \"game\"}", .reason = "bundle_id 'game'" },
@@ -322,6 +358,25 @@ test "every rejection names its reason" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "a device build with signing parses; a v0.1 file is unchanged by the signing block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostic = .{};
+    const s = try parse(arena.allocator(),
+        \\{"schema_version": 1, "bundle_id": "com.a.b", "team_id": "ABCDE12345", "destination": "device",
+        \\ "signing": {"identity": "Apple Development: Jo (ABCDE12345)", "profile": "signing/dev.mobileprovision"}}
+    , &diag);
+    try std.testing.expectEqual(Destination.device, s.destination);
+    try std.testing.expectEqualStrings("Apple Development: Jo (ABCDE12345)", s.signing.identity.?);
+    try std.testing.expectEqualStrings("signing/dev.mobileprovision", s.signing.profile.?);
+    // Signing on a simulator build is accepted (and unused).
+    const sim = try parse(arena.allocator(), "{\"schema_version\": 1, \"bundle_id\": \"com.a.b\", \"signing\": {\"identity\": \"X\"}}", &diag);
+    try std.testing.expectEqual(Destination.simulator, sim.destination);
+    // The v0.1 example file parses as before.
+    const v01 = try parse(arena.allocator(), full, &diag);
+    try std.testing.expect(v01.signing.identity == null and v01.signing.profile == null);
 }
 
 test "bundleId follows the CFBundleIdentifier rule" {

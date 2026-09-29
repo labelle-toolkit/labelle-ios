@@ -12,7 +12,7 @@
     .initial_prefab = "main", .states = .{"playing"},
     .layers = .{ .{ .name = "hud", .order = 0, .space = .screen } },
     .core_version = "2.1.0", .engine_version = "3.4.1", .gfx_version = "2.2.0",
-    .assembler_version = "0.117.1",
+    .assembler_version = "0.120.0",
     .plugins = .{ .{ .name = "ios", .repo = "local:../.." } },
     .provider_config = .{ .{ .package = "ios", .file = "providers/ios.json" } },
 }

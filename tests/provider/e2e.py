@@ -3,16 +3,27 @@
 python tests/provider/e2e.py --cli <labelle> --zig <zig>
 
 A fixture project pins this checkout as `local:` and hands the provider
-`providers/ios.json` through `.provider_config`. The CLI resolves the package,
-builds `bin/labelle-ios` with `zig build --system`, writes a contract 1.3.0
-context and runs the hooks behind `labelle build|run|bundle --platform=ios`.
+`providers/ios.json` through `.provider_config`. The CLI (4.0+: the `ios`
+namespace is the provider's) resolves the package, builds `bin/labelle-ios`
+with `zig build --system`, negotiates the newest wire both speak (1.5.0 on
+CLI 4.0, 1.6.0 with build_options) and runs the hooks behind
+`labelle build|run|bundle --platform=ios` and the `labelle ios doctor|devices|
+xcode|run` commands.
 
 Generation is a fake assembler (the CLI suites' pattern) whose target
 `build.zig` installs a marker executable, so no Xcode is needed. `xcrun` and
 `codesign` are fakes on PATH (a Python script behind a `sh` shim) that log
 their argv and emulate `simctl list -j`/`bootstatus`/`install`/`launch`/
-`terminate`. On Windows the launch hook must refuse cleanly (the simulator
-needs macOS) and never reach `xcrun`; build and bundle still run there.
+`terminate` and `devicectl list|install|launch`; `xcode-select`,
+`xcodebuild`, `security` and `PlistBuddy` are fakes too (doctor, signing).
+On Windows the launch hook must refuse cleanly (the simulator needs macOS)
+and never reach `xcrun`; build and bundle still run there.
+
+Device builds (`destination: "device"`): on a CLI that negotiates 1.6.0 the
+`device` hook's build_options make the fake build install its device
+executable, the app is signed with the identity and profile, run through
+`devicectl` and bundled as an `.ipa`; on an older wire the build is refused
+with the upgrade message. The real signing and a real device are manual.
 """
 import argparse
 import json
@@ -48,18 +59,29 @@ if argv and argv[0] == "--protocol-version":
     print(99)
 elif argv and argv[0] == "install":
     print("FIXTURE_INSTALL_DONE", file=sys.stderr, flush=True)
+elif argv and argv[0] == "describe":
+    # CLI 4.0 takes the backend and the target dir from `describe` (cli#471 D4).
+    import json
+    target_name = argv[argv.index("--target") + 1]
+    print(json.dumps({"schema": "labelle.describe/v1", "target": target_name,
+                      "target_dir": ".labelle/sokol_" + target_name,
+                      "backend": {"name": "sokol"}, "asset_format": "png", "supported": True}))
 elif argv and argv[0] == "generate":
     root = Path(argv[argv.index("--project-root") + 1])
-    backend = argv[argv.index("--backend") + 1]
-    platform_name = argv[argv.index("--platform") + 1]
+    backend = argv[argv.index("--backend") + 1] if "--backend" in argv else "sokol"
+    platform_name = argv[argv.index("--target" if "--target" in argv else "--platform") + 1]
     target = root / ".labelle" / f"{backend}_{platform_name}"
     target.mkdir(parents=True, exist_ok=True)
     exes = [e for e in os.environ.get("FAKE_EXES", "game").split(",") if e]
+    # `-Ddevice=true` (the device hook's build_options) installs the device
+    # executable instead, as the real iOS build switches SDKs.
     lines = ['const std = @import("std");', 'pub fn build(b: *std.Build) void {',
-             '    _ = b.standardOptimizeOption(.{});']
+             '    _ = b.standardOptimizeOption(.{});',
+             '    const device = b.option(bool, "device", "Build for iOS device instead of simulator") orelse false;']
     for e in exes:
         (target / e).write_text("FAKE-MACHO-EXECUTABLE")
-        lines.append(f'    b.getInstallStep().dependOn(&b.addInstallBinFile(b.path("{e}"), "{e}").step);')
+        (target / (e + ".device")).write_text("FAKE-MACHO-DEVICE")
+        lines.append(f'    b.getInstallStep().dependOn(&b.addInstallBinFile(b.path(if (device) "{e}.device" else "{e}"), "{e}").step);')
     lines.append('}')
     (target / "build.zig").write_text("\n".join(lines) + "\n")
     (target / "assets" / "sub").mkdir(parents=True, exist_ok=True)
@@ -82,6 +104,13 @@ DEVICES = {
     }
 }
 
+# `devicectl list devices --json-output`: one wired, paired iPhone.
+PHYSICAL = {'info': {'outcome': 'success'}, 'result': {'devices': [
+    {'identifier': 'PHONE-CORE-0001',
+     'connectionProperties': {'pairingState': 'paired', 'transportType': 'wired', 'tunnelState': 'connected'},
+     'deviceProperties': {'name': 'Fixture iPhone', 'osVersionNumber': '18.1', 'developerModeStatus': 'enabled'},
+     'hardwareProperties': {'platform': 'iOS', 'marketingName': 'iPhone 15', 'udid': '00008130-FIXTURE'}}]}}
+
 # The fake xcrun/codesign. Every call appends one JSON line to $FAKE_LOG:
 # the tool, its argv, the SIMCTL_CHILD_* part of its environment and its
 # parent pid (the provider tool, for the signal test).
@@ -97,6 +126,48 @@ state = Path(os.environ["FAKE_STATE"])
 fail = os.environ.get("FAKE_FAIL", "")
 if tool == "codesign":
     sys.exit(0)
+if tool == "xcode-select":
+    print("/Applications/Xcode.app/Contents/Developer")
+    sys.exit(0)
+if tool == "xcodebuild":
+    if args == ["-version"]:
+        print("Xcode 16.2\nBuild version 16C5032a")
+    sys.exit(1 if "license" in fail.split(",") and args[:1] == ["-license"] else 0)
+if tool == "security":
+    if args[:1] == ["find-identity"]:
+        print('  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Fixture (ABCDE12345)"')
+        print("     1 valid identities found")
+    elif args[:3] == ["cms", "-D", "-i"]:
+        print("<plist><dict><key>Entitlements</key><dict/></dict></plist>")
+    sys.exit(0)
+if tool == "PlistBuddy":
+    if "Print :Entitlements:application-identifier" in args:
+        print(os.environ.get("FAKE_APP_ID", "ABCDE12345.com.labelle.fixture"))
+    elif "-x" in args:
+        print("<plist><dict/></plist>")
+    sys.exit(0)
+if args[:1] == ["--version"]:
+    print("xcrun version 70.")
+    sys.exit(0)
+if args[:1] == ["--sdk"] and args[1] in ("iphoneos", "iphonesimulator"):
+    print("/Fake/" + args[1] + ".sdk")
+    sys.exit(0)
+if args[:2] == ["--find", "devicectl"]:
+    if "no-devicectl" in fail.split(","):
+        sys.exit(1)
+    print("/Fake/usr/bin/devicectl")
+    sys.exit(0)
+if args[:1] == ["devicectl"]:
+    if args[1:3] == ["list", "devices"]:
+        out = args[args.index("--json-output") + 1]
+        Path(out).write_text(os.environ["FAKE_PHYSICAL"])
+    elif args[1:4] == ["device", "install", "app"]:
+        assert (Path(args[-1]) / "embedded.mobileprovision").is_file(), args
+    elif args[1:4] == ["device", "process", "launch"]:
+        print("FAKE_DEVICE_APP started " + json.dumps(args[4:]), flush=True)
+    else:
+        sys.exit("fake devicectl: unexpected " + repr(args))
+    sys.exit(0)
 if args[:1] != ["simctl"]:
     # Not the simulator: Zig itself asks `xcrun --sdk macosx --show-sdk-path`
     # on a macOS host. Hand it to the real xcrun.
@@ -107,7 +178,10 @@ sub = args[1]
 if sub in fail.split(","):
     print(f"fake simctl {sub}: failing on request", file=sys.stderr)
     sys.exit(2)
-if sub == "list":
+if sub == "list" and args[2:] == ["-j", "runtimes"]:
+    print(json.dumps({"runtimes": [{"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-2",
+                                    "version": "18.2", "isAvailable": True, "name": "iOS 18.2"}]}))
+elif sub == "list":
     assert args[2:] == ["-j", "devices", "available"], args
     print(os.environ["FAKE_DEVICES"])
 elif sub == "bootstatus":
@@ -156,7 +230,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
     # carries the tool's name too.
     fakes, bin_dir = temp / 'fakes', temp / 'bin'
     bin_dir.mkdir()
-    for name in ('xcrun', 'codesign'):
+    for name in ('xcrun', 'codesign', 'xcode-select', 'xcodebuild', 'security', 'PlistBuddy'):
         (fakes / name).mkdir(parents=True)
         (fakes / name / name).write_text(FAKE_TOOL)
         shim(bin_dir / name, fakes / name / name)
@@ -170,7 +244,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
     (project / 'providers').mkdir(parents=True)
     (project / 'art').mkdir()
     (project / 'art/icon.png').write_bytes(b'\x89PNG\r\n\x1a\n' + b'FAKE-ICON')
-    dep = f'.{{ .name = "ios", .repo = "local:{repo.as_posix()}", .version = "0.1.0" }}'
+    dep = f'.{{ .name = "ios", .repo = "local:{repo.as_posix()}", .version = "0.2.0" }}'
     (project / 'project.labelle').write_text(
         f'.{{ .name = "game", .title = "Fixture Game", .zig_version = "{version}", .backend = .sokol, '
         f'.app_icon = "art/icon.png", .plugins = .{{ {dep} }}, '
@@ -185,6 +259,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
     env = {k: v for k, v in os.environ.items() if not k.startswith(('FAKE_', 'SIMCTL_CHILD_'))}
     env.update(LABELLE_HOME=str(home), LABELLE_ZIG=zig, LABELLE_ASSEMBLER=str(assembler),
                LABELLE_NO_PREBUILD='1', FAKE_LOG=str(log), FAKE_STATE=str(state), FAKE_DEVICES=json.dumps(DEVICES),
+               FAKE_PHYSICAL=json.dumps(PHYSICAL),
                PATH=os.pathsep.join([str(bin_dir), env.get('PATH', '')]))
     # A stale SIMCTL_CHILD_ in the caller's environment must not reach the app.
     env['SIMCTL_CHILD_LABELLE_STALE'] = 'leaked'
@@ -218,7 +293,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
     ios_dir = target / 'zig-out' / 'ios'
     app = ios_dir / 'Fixture_Game.app'
 
-    # ── discovery: no namespace, so nothing in help ────────────────────────
+    # ── discovery: the `ios` namespace is the provider's (CLI 4.0) ─────────
     _, out = run('help')
     assert 'ReservedNamespace' not in out, out
 
@@ -273,7 +348,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
 
     # Settings are validated before anything is written.
     for body, reason in (
-        ({'schema_version': 1, 'bundle_id': 'com.a.b', 'destination': 'device'}, 'device builds arrive in v0.2'),
+        ({'schema_version': 1, 'bundle_id': 'com.a.b', 'destination': 'device'}, 'destination "device" needs "signing"'),
+        ({'schema_version': 1, 'bundle_id': 'com.a.b', 'signing': {'team': 'x'}}, "unknown key 'signing.team'"),
         ({'schema_version': 1, 'bundle_id': 'game'}, "bundle_id 'game' is not a valid bundle identifier"),
         ({'schema_version': 1, 'bundle_id': 'com.a.b', 'package_name': 'x'}, "unknown key 'package_name'"),
         ({'schema_version': 1, 'bundle_id': 'com.a.b', 'simulator': {'udid': 'x'}}, "unknown key 'simulator.udid'"),
@@ -448,5 +524,138 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
     elsewhere = temp / 'release-out'
     run('bundle', '--platform=ios', f'--output={elsewhere}')
     assert [f.name for f in elsewhere.iterdir()] == ['Fixture_Game-simulator.zip'], list(elsewhere.iterdir())
+
+    # ── labelle ios doctor [--json] [--fix] ───────────────────────────────
+    # Every doctor accepts both flags (cli#521). With the fakes a macOS host
+    # passes; any other host fails on the macOS check alone.
+    code, out = run('ios', 'doctor', ok=macos)
+    assert 'labelle ios doctor' in out, out
+    result = subprocess.run([cli, 'ios', 'doctor', '--json'], cwd=project, env=env, capture_output=True,
+                            encoding='utf-8', errors='replace', timeout=900)
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    assert report['id'] == 'ios' and report['required'] is True, report
+    assert report['ok'] is macos and (result.returncode == 0) is macos, (report, result.stderr)
+    ids = [item['id'] for item in report['items']]
+    for item in report['items']:
+        assert set(item) == {'id', 'name', 'ok', 'fixable', 'size_mb', 'action', 'detail', 'hint'}, item
+    if macos:
+        assert ids[:4] == ['macos', 'xcrun', 'xcode', 'license'] and 'backend' in ids, ids
+        # The license missing: a failure with the exact command, never run.
+        code, out = run('ios', 'doctor', '--fix', ok=False, extra_env={'FAKE_FAIL': 'license'})
+        assert '[ FAIL ] Xcode license accepted' in out and 'sudo xcodebuild -license accept' in out, out
+        assert '--fix: nothing is fixed automatically' in out, out
+        assert not [c for c in calls('xcodebuild') if c['argv'][:2] == ['-license', 'accept']], calls('xcodebuild')
+    else:
+        assert ids == ['macos'], ids
+    _, out = run('ios', 'doctor', '--verbose', ok=False)
+    assert "unknown argument '--verbose'" in out, out
+
+    # ── labelle ios devices ───────────────────────────────────────────────
+    if macos:
+        _, out = run('ios', 'devices')
+        assert 'IPHONE16-0001  iPhone 16 (iOS 18.2)' in out and 'IPAD-0001  iPad Air 11-inch (M2) (iOS 18.2, booted)' in out, out
+        assert 'PHONE-CORE-0001  Fixture iPhone (iPhone 15, iOS 18.1, wired)' in out, out
+        _, out = run('ios', 'devices', extra_env={'FAKE_FAIL': 'no-devicectl'})
+        assert '(devicectl needs Xcode 15 or newer)' in out, out
+    else:
+        _, out = run('ios', 'devices', ok=False)
+        assert 'needs macOS' in out, out
+
+    # ── labelle ios xcode ─────────────────────────────────────────────────
+    run('build', '--platform=ios')
+    _, out = run('ios', 'xcode')
+    xproj = project / 'ios-xcode' / 'Fixture_Game.xcodeproj' / 'project.pbxproj'
+    assert xproj.is_file(), out
+    pbx = xproj.read_text()
+    assert 'PRODUCT_BUNDLE_IDENTIFIER = com.labelle.fixture;' in pbx and 'SUPPORTED_PLATFORMS = iphonesimulator;' in pbx, pbx
+    assert (project / 'ios-xcode' / 'Fixture_Game' / 'game').read_text() == EXE_BYTES
+    assert (project / 'ios-xcode' / 'Fixture_Game' / 'assets' / 'sub' / 'level.json').is_file()
+    assert 'wraps a simulator build' in out, out
+    if macos and os.path.exists('/usr/bin/plutil'):
+        subprocess.run(['/usr/bin/plutil', '-lint', str(xproj)], check=True)
+    _, out = run('ios', 'xcode', '--open', ok=False)
+    assert "unknown argument '--open'" in out, out
+
+    # ── labelle ios run ───────────────────────────────────────────────────
+    if not windows:
+        reset_log()
+        _, out = run('ios', 'run', '--device=IPAD-0001', '--level=2')
+        assert [c[0] for c in simctl()] == ['list', 'install', 'launch'], simctl()
+        assert simctl()[2][3:] == ['IPAD-0001', 'com.labelle.fixture', '--level=2'], simctl()
+        assert 'the app exited (status 0)' in out, out
+        _, out = run('ios', 'run', ok=False, extra_env={'FAKE_APP_EXIT': '4'})
+        assert 'the app exited (status 4)' in out, out
+
+    # ── destination "device": build_options, signing, devicectl, .ipa ─────
+    (project / 'signing').mkdir(exist_ok=True)
+    (project / 'signing' / 'dev.mobileprovision').write_bytes(b'FAKE-PROFILE')
+    device_settings = dict(good, destination='device', team_id='ABCDE12345',
+                           signing={'identity': 'Apple Development: Fixture (ABCDE12345)',
+                                    'profile': 'signing/dev.mobileprovision'})
+    settings.write_text(json.dumps(device_settings))
+    reset_log()
+    result = subprocess.run([cli, 'build', '--platform=ios'], cwd=project, env=env, capture_output=True,
+                            timeout=900, encoding='utf-8', errors='replace')
+    out = result.stdout + result.stderr
+    if 'this CLI negotiated' in out:
+        # A CLI below contract 1.6.0: the device build is refused, naming the upgrade.
+        assert result.returncode != 0 and "hook 'ios/device' failed" in out, out
+        assert 'needs labelle-cli with provider contract 1.6.0' in out, out
+        print('note: this CLI negotiates a wire below 1.6.0; device builds checked for the refusal only')
+    elif not macos:
+        assert result.returncode != 0 and 'signing needs macOS' in out, out
+    else:
+        assert result.returncode == 0, out
+        assert "running before hook 'ios/device'" in out and 'device build: -Ddevice=true' in out, out
+        assert (target / 'zig-out' / 'bin' / 'game').read_text() == 'FAKE-MACHO-DEVICE', out
+        assert (app / 'game').read_text() == 'FAKE-MACHO-DEVICE'
+        assert '<string>iPhoneOS</string>' in (app / 'Info.plist').read_text()
+        assert (app / 'embedded.mobileprovision').read_bytes() == b'FAKE-PROFILE'
+        signed = calls('codesign')[-1]['argv']
+        assert signed[:3] == ['--force', '--sign', 'Apple Development: Fixture (ABCDE12345)'], signed
+        assert signed[3] == '--entitlements' and Path(signed[-1]).name == 'Fixture_Game.app', signed
+        assert json.loads((ios_dir / 'app.json').read_text())['destination'] == 'device'
+
+        # A profile for another app is refused before signing.
+        _, out = run('build', '--platform=ios', ok=False, extra_env={'FAKE_APP_ID': 'ABCDE12345.com.other'})
+        assert "does not cover bundle_id 'com.labelle.fixture'" in out, out
+        run('build', '--platform=ios')
+
+        # run: devicectl on the one connected device.
+        reset_log()
+        _, out = run('run', '--platform=ios', '--scene=intro')
+        dctl = [e['argv'] for e in calls('xcrun') if e['argv'][:1] == ['devicectl']]
+        assert [d[1:3] for d in dctl] == [['list', 'devices'], ['device', 'install'], ['device', 'process']], dctl
+        assert dctl[1][-2:] == ['PHONE-CORE-0001', str(app)] or dctl[1][-1] == str(app), dctl
+        launch = dctl[2]
+        assert launch[launch.index('--device') + 1] == 'PHONE-CORE-0001' and '--console' in launch, launch
+        assert json.loads(launch[launch.index('--environment-variables') + 1]) == {'LABELLE_SCENE': 'intro'}, launch
+        assert simctl() == [], simctl()
+        assert 'FAKE_DEVICE_APP started' in out, out
+
+        # bundle: an .ipa with the signed app under Payload/.
+        run('bundle', '--platform=ios', '--build-number=9')
+        ipa = target / 'zig-out' / 'bundle' / 'ios' / 'Fixture_Game.ipa'
+        with zipfile.ZipFile(ipa) as z:
+            assert z.testzip() is None
+            names = z.namelist()
+            assert 'Payload/Fixture_Game.app/game' in names and 'Payload/Fixture_Game.app/embedded.mobileprovision' in names, names
+            assert z.read('Payload/Fixture_Game.app/game').decode() == 'FAKE-MACHO-DEVICE'
+            assert '<string>9</string>' in z.read('Payload/Fixture_Game.app/Info.plist').decode()
+
+        # The same provider capped below 1.6.0 cannot carry the option: refused.
+        capped = temp / 'labelle-ios-capped'
+        shutil.copytree(repo, capped, ignore=shutil.ignore_patterns('.git', '.zig-cache', 'zig-out', 'tests'))
+        manifest = capped / 'plugin.labelle'
+        manifest.write_text(manifest.read_text().replace('">=1.3.0 <1.7.0"', '">=1.3.0 <1.6.0"'))
+        pinned = (project / 'project.labelle').read_text()
+        capped_dep = f'.{{ .name = "ios", .repo = "local:{capped.as_posix()}", .version = "0.2.0" }}'
+        (project / 'project.labelle').write_text(pinned.replace(dep, capped_dep))
+        (project / 'labelle.lock').write_text(f'.{{ .plugins = .{{ {capped_dep} }} }}')
+        _, out = run('build', '--platform=ios', ok=False)
+        assert 'needs labelle-cli with provider contract 1.6.0' in out and 'negotiated 1.5.0' in out, out
+        (project / 'project.labelle').write_text(pinned)
+        (project / 'labelle.lock').write_text(f'.{{ .plugins = .{{ {dep} }} }}')
+    settings.write_text(json.dumps(good))
 
 print('labelle-ios provider e2e: ok')

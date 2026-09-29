@@ -19,6 +19,14 @@ pub fn run(a: std.mem.Allocator, io: std.Io, argv: []const []const u8, opts: Opt
     });
 }
 
+/// This process's id, for per-process scratch names.
+pub fn pid() u64 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
 /// True when a child exited normally with status 0.
 pub fn succeeded(term: std.process.Child.Term) bool {
     return switch (term) {
