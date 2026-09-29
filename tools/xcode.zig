@@ -286,12 +286,24 @@ fn copyTree(a: std.mem.Allocator, io: std.Io, src: []const u8, dst: []const u8) 
     }
 }
 
+/// One path component: non-empty, no separator, not `.` or `..`.
+pub fn plainName(name: []const u8) bool {
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    return std.mem.indexOfAny(u8, name, "/\\\x00") == null;
+}
+
 /// Write `<out>/<Name>.xcodeproj` and `<out>/<Name>/`, replacing an earlier
 /// export of the same name (and nothing else in `<out>`). Returns the
 /// `.xcodeproj` path.
 pub fn write(a: std.mem.Allocator, io: std.Io, in: WriteInputs) ![]const u8 {
     const cwd = std.Io.Dir.cwd();
     const p = in.project;
+    // Both paths below are deleted first: the name must be one plain path
+    // component, or `<out>` itself (or a path outside it) would go.
+    if (!plainName(p.name)) {
+        std.debug.print("labelle-ios: '{s}' is not usable as the Xcode project name (empty, '.', '..' or a path)\n", .{p.name});
+        return error.InvalidAppName;
+    }
     const xcodeproj = try std.fs.path.join(a, &.{ in.out_dir, try std.fmt.allocPrint(a, "{s}.xcodeproj", .{p.name}) });
     const files = try std.fs.path.join(a, &.{ in.out_dir, p.name });
     try cwd.deleteTree(io, xcodeproj);
@@ -438,6 +450,28 @@ test "write: the project around a built app, replacing an earlier export only" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/G/stale.txt", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/G/embedded.mobileprovision", .{}));
     try std.testing.expectEqualStrings("mine", try tmp.dir.readFileAlloc(io, "out/keep.txt", a, .limited(64)));
+}
+
+test "write: an empty or path-like name is refused before anything is deleted" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try tmp.dir.createDirPath(io, "out/sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "out/keep.txt", .data = "mine" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "mine" });
+    for ([_][]const u8{ "", ".", "..", "sub/..", "../out", "a\\b" }) |name| {
+        var p = sample;
+        p.name = name;
+        try std.testing.expectError(error.InvalidAppName, write(a, io, .{ .app = root, .out_dir = try std.fs.path.join(a, &.{ root, "out" }), .project = p }));
+    }
+    try tmp.dir.access(io, "out/keep.txt", .{});
+    try tmp.dir.access(io, "out/sub", .{});
+    try tmp.dir.access(io, "keep.txt", .{});
+    try std.testing.expect(plainName("Flying_Platform") and plainName("My-Game"));
 }
 
 test "parseArgs" {

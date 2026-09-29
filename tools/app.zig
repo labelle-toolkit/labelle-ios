@@ -887,7 +887,7 @@ test "make: a device app declares iPhoneOS, embeds the profile and is signed wit
     const a = arena.allocator();
     var f = try Fixture.init(a);
     defer f.tmp.cleanup();
-    var fake = try signing.FakeTools.init(a, io, f.tmp.dir, "ABCDE12345.*");
+    var fake = try signing.FakeTools.init(a, io, f.tmp.dir, .{ .app_id = "ABCDE12345.*", .keychain_group = "ABCDE12345.*" });
     try f.tmp.dir.writeFile(io, .{ .sub_path = "dev.mobileprovision", .data = "PROFILE" });
     var in = try f.inputs(a, device_settings);
     in.env = &fake.env;

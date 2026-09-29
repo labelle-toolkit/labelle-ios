@@ -33,6 +33,14 @@ pub const device_not_macos_message = "running on an iOS device requires macOS (X
 /// A `--timeout` stop is reported through `run.outcome_file` (wire 1.5.0+),
 /// so the CLI skips the after-run hooks as its own watchdog would.
 pub fn launchHook(a: std.mem.Allocator, io: std.Io, in: Inputs) !u8 {
+    // The hook does not declare `.watch = true`, so the CLI refuses
+    // `labelle run --watch` before any build and never hands it a session.
+    // Should one arrive anyway, refuse it rather than run once and silently
+    // ignore every later publication.
+    if (in.run.watch != null) {
+        std.debug.print("labelle-ios: `labelle run --watch` is not supported on iOS (the app is installed once; rebuild and run again)\n", .{});
+        return error.WatchNotSupported;
+    }
     const args = simctl.parseRunArgs(a, in.run.args) catch {
         std.debug.print("labelle-ios: --device needs a simulator or device UDID or name (labelle run --platform=ios -- --device=<udid>)\n", .{});
         return error.InvalidRunArguments;

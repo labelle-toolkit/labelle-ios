@@ -133,9 +133,12 @@ if tool == "xcodebuild":
     if args == ["-version"]:
         print("Xcode 16.2\nBuild version 16C5032a")
     sys.exit(1 if "license" in fail.split(",") and args[:1] == ["-license"] else 0)
+CERT = b"FIXTURE-CERT"
 if tool == "security":
     if args[:1] == ["find-identity"]:
-        print('  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Fixture (ABCDE12345)"')
+        import hashlib
+        sha = hashlib.sha1(CERT).hexdigest().upper()
+        print(f'  1) {sha} "Apple Development: Fixture (ABCDE12345)"')
         print("     1 valid identities found")
     elif args[:3] == ["cms", "-D", "-i"]:
         print("<plist><dict><key>Entitlements</key><dict/></dict></plist>")
@@ -143,8 +146,17 @@ if tool == "security":
 if tool == "PlistBuddy":
     if "Print :Entitlements:application-identifier" in args:
         print(os.environ.get("FAKE_APP_ID", "ABCDE12345.com.labelle.fixture"))
-    elif "-x" in args:
+    elif "Print :TeamIdentifier:0" in args:
+        print("ABCDE12345")
+    elif "Print :DeveloperCertificates" in args:
+        import base64
+        print("<plist><array><data>" + base64.b64encode(CERT).decode() + "</data></array></plist>")
+    elif "Print :Entitlements" in args:
         print("<plist><dict/></plist>")
+    elif any(a.startswith("Set :") for a in args):
+        pass
+    else:
+        sys.exit(1)
     sys.exit(0)
 if args[:1] == ["--version"]:
     print("xcrun version 70.")

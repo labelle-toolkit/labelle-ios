@@ -7,9 +7,9 @@
 //! one. iOS runtime services (lifecycle, safe areas, ...) will live here.
 
 /// The provider release this module ships with.
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 test "the module is importable" {
     const std = @import("std");
-    try std.testing.expectEqualStrings("0.1.0", version);
+    try std.testing.expectEqualStrings("0.2.0", version);
 }

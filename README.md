@@ -122,7 +122,7 @@ labelle run --platform=ios --timeout=30s            # stop the app after 30 s
 |---|---|
 | `labelle ios doctor [--json] [--fix]` | Checks a macOS host, `xcrun`, Xcode selected (`xcode-select -p`, not the Command Line Tools), the Xcode license (`xcodebuild -license check`), the iOS simulator and device SDKs, a simulator runtime at `minimum_ios` or newer, `codesign`, `devicectl`, the project's backend (a warning unless sokol) and, for a device build, the signing identity (in `security find-identity`) and profile. Exits 1 when a required item is missing. `--json` prints the capability object `labelle doctor --json` aggregates (`{"id":"ios","required":true,"ok":…,"items":[…]}`, the labelle-android shape). `--fix` fixes nothing itself (every fix needs `sudo`, Xcode or a large download, and the doctor never runs `sudo`): it prints the exact commands, e.g. `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`, `sudo xcodebuild -license accept`, `xcodebuild -downloadPlatform iOS`. Works outside a project. |
 | `labelle ios devices` | Lists the available iOS simulators (newest runtime first) and, with Xcode 15+, the physical devices from `devicectl list devices`, with the id `--device=` takes and each device's connection state. |
-| `labelle ios run [--device=<udid\|name>] [app args…]` | Installs and runs the app the last `labelle build --platform=ios` made, exactly as the `launch` hook does (simulator or device by the build's destination), without building. Refuses an app that is stale against the build or the settings. |
+| `labelle ios run [--device=<udid\|name>] [app args…] [-- app args…]` | After `--`, every argument reaches the app verbatim. Installs and runs the app the last `labelle build --platform=ios` made, exactly as the `launch` hook does (simulator or device by the build's destination), without building. Refuses an app that is stale against the build or the settings. |
 | `labelle ios xcode [--output=DIR]` | Writes an Xcode project around the built app, `ios-xcode/<AppName>.xcodeproj` plus `ios-xcode/<AppName>/` (the executable, its `Info.plist`, icons and `assets/`), for Xcode's automatic signing (`DEVELOPMENT_TEAM` from `team_id`), the debugger or Instruments. The target has no sources: a Copy Files phase embeds the prebuilt executable. A project wrapping a simulator build is limited to simulators (`SUPPORTED_PLATFORMS`). Only the export's own two entries are replaced. |
 
 ## Device builds and signing
@@ -144,8 +144,11 @@ labelle run --platform=ios --timeout=30s            # stop the app after 30 s
    `-Ddevice=true` (contract 1.6.0), sokol builds for `aarch64-ios`, and the
    `app` hook signs the bundle: `security cms -D -i <profile>` decodes the
    profile, its `application-identifier` must cover `bundle_id` (exactly or
-   by wildcard) and belong to `team_id` when set, its `Entitlements` are
-   extracted with `PlistBuddy`, the profile is embedded as
+   by wildcard), its `TeamIdentifier` must be `team_id` when set, and its
+   `DeveloperCertificates` must include the identity's certificate; its
+   `Entitlements` are extracted with `PlistBuddy` (a wildcard
+   `application-identifier` or keychain group expanded to
+   `<prefix>.<bundle_id>`, as Xcode does), the profile is embedded as
    `embedded.mobileprovision`, and `codesign --force --sign <identity>
    --entitlements <…> --generate-entitlement-der` signs the app.
 2. `labelle run --platform=ios` (or `labelle ios run`) installs and runs it

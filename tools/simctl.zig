@@ -220,9 +220,11 @@ pub fn newestRuntime(runtimes: []const Runtime, minimum: [3]u32) ?Runtime {
     return chosen;
 }
 
-/// What the `launch` hook takes from `labelle run ... -- <args>`: a
-/// `--device=<udid|name>` (or `--device <udid|name>`) choice, and the rest,
-/// forwarded to the app as its arguments.
+/// What the `launch` hook takes from `labelle run ... -- <args>` (and
+/// `labelle ios run <args>`): a `--device=<udid|name>` (or `--device
+/// <udid|name>`) choice, and the rest, forwarded to the app as its
+/// arguments. A `--` stops option parsing; what follows it reaches the app
+/// unchanged.
 pub const RunArgs = struct {
     device: ?[]const u8 = null,
     app_args: []const []const u8 = &.{},
@@ -234,6 +236,12 @@ pub fn parseRunArgs(a: std.mem.Allocator, args: []const []const u8) !RunArgs {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        // `--` ends the provider's options: everything after it is the
+        // app's, verbatim (a `--device` of its own included).
+        if (std.mem.eql(u8, arg, "--")) {
+            try rest.appendSlice(a, args[i + 1 ..]);
+            break;
+        }
         if (std.mem.startsWith(u8, arg, "--device=")) {
             out.device = arg["--device=".len..];
         } else if (std.mem.eql(u8, arg, "--device")) {
@@ -486,4 +494,19 @@ test "parseRuntimes: iOS only; newestRuntime honours availability and the floor"
     for ([_][]const u8{ "", "{}", "{\"runtimes\": {}}", "{\"runtimes\": [{}]}" }) |bad| {
         try std.testing.expectError(error.InvalidSimctlOutput, parseRuntimes(a, bad));
     }
+}
+
+test "parseRunArgs: `--` ends the provider's options; what follows reaches the app verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try parseRunArgs(a, &.{ "--device=SIM", "--level=1", "--", "--device=app-own", "--", "x" });
+    try std.testing.expectEqualStrings("SIM", r.device.?);
+    try std.testing.expectEqual(@as(usize, 4), r.app_args.len);
+    try std.testing.expectEqualStrings("--level=1", r.app_args[0]);
+    try std.testing.expectEqualStrings("--device=app-own", r.app_args[1]);
+    try std.testing.expectEqualStrings("--", r.app_args[2]);
+    const only = try parseRunArgs(a, &.{ "--", "--device", "d" });
+    try std.testing.expect(only.device == null);
+    try std.testing.expectEqual(@as(usize, 2), only.app_args.len);
 }
