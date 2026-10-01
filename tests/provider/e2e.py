@@ -40,6 +40,9 @@ import zipfile
 p = argparse.ArgumentParser()
 p.add_argument('--cli', required=True)
 p.add_argument('--zig', required=True)
+# CI pins a CLI that speaks wire 1.6.0: the device flow must then run end to
+# end, never fall back to the old-wire refusal.
+p.add_argument('--require-wire', default=None)
 a = p.parse_args()
 cli, zig = str(Path(a.cli).resolve()), str(Path(a.zig).resolve())
 repo = Path(__file__).resolve().parents[2]
@@ -611,6 +614,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-ios-provider-') as temp:
     out = result.stdout + result.stderr
     if 'this CLI negotiated' in out:
         # A CLI below contract 1.6.0: the device build is refused, naming the upgrade.
+        assert a.require_wire is None, f'expected wire {a.require_wire}, but the CLI negotiated below 1.6.0:\n{out}'
         assert result.returncode != 0 and "hook 'ios/device' failed" in out, out
         assert 'needs labelle-cli with provider contract 1.6.0' in out, out
         print('note: this CLI negotiates a wire below 1.6.0; device builds checked for the refusal only')

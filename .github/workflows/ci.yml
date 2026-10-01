@@ -81,8 +81,8 @@ jobs:
           ref: v4.1.0
           path: .test-cli
           persist-credentials: false
-      # bash: PowerShell splits `-Dversion=4.0.0` at the dot.
-      - run: zig build -Dversion=4.0.0
+      # bash: PowerShell splits `-Dversion=4.1.0` at the dot.
+      - run: zig build -Dversion=4.1.0
         shell: bash
         working-directory: .test-cli
       - name: Exercise discovery, the app hook, launch and bundle
@@ -94,7 +94,7 @@ jobs:
             zig_bin="$(cygpath -w "$zig_bin")"
             cli_bin="$cli_bin.exe"
           fi
-          python tests/provider/e2e.py --cli "$cli_bin" --zig "$zig_bin"
+          python tests/provider/e2e.py --cli "$cli_bin" --zig "$zig_bin" --require-wire 1.6.0
 
   # A real sokol app on a real iOS simulator: the pinned CLI, the released
   # assembler (0.120.0, `describe` for CLI 4.0) and sokol backend (v0.8.1) build tests/ios with a clean
@@ -129,7 +129,7 @@ jobs:
           ref: v4.1.0
           path: .test-cli
           persist-credentials: false
-      - run: zig build -Dversion=4.0.0
+      - run: zig build -Dversion=4.1.0
         shell: bash
         working-directory: .test-cli
       - name: Build, launch, screenshot
