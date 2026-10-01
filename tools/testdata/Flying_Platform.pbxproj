@@ -1,0 +1,204 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1ABE11E00000000000000011 = {isa = PBXBuildFile; fileRef = 1ABE11E0000000000000000F; };
+		1ABE11E00000000000000101 = {isa = PBXBuildFile; fileRef = 1ABE11E00000000000000100; };
+		1ABE11E00000000000000103 = {isa = PBXBuildFile; fileRef = 1ABE11E00000000000000102; };
+		1ABE11E00000000000000105 = {isa = PBXBuildFile; fileRef = 1ABE11E00000000000000104; };
+/* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		1ABE11E00000000000000007 = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 6;
+			files = (
+				1ABE11E00000000000000011,
+			);
+			name = "Embed Executable";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		1ABE11E00000000000000005 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Flying_Platform.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1ABE11E0000000000000000F = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; path = game; sourceTree = "<group>"; };
+		1ABE11E00000000000000010 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1ABE11E00000000000000100 = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@2x.png"; sourceTree = "<group>"; };
+		1ABE11E00000000000000102 = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AppIcon60x60@3x.png"; sourceTree = "<group>"; };
+		1ABE11E00000000000000104 = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		1ABE11E00000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				1ABE11E00000000000000003,
+				1ABE11E00000000000000004,
+			);
+			sourceTree = "<group>";
+		};
+		1ABE11E00000000000000003 = {
+			isa = PBXGroup;
+			children = (
+				1ABE11E0000000000000000F,
+				1ABE11E00000000000000010,
+				1ABE11E00000000000000100,
+				1ABE11E00000000000000102,
+				1ABE11E00000000000000104,
+			);
+			path = Flying_Platform;
+			sourceTree = "<group>";
+		};
+		1ABE11E00000000000000004 = {
+			isa = PBXGroup;
+			children = (
+				1ABE11E00000000000000005,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1ABE11E00000000000000006 = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1ABE11E0000000000000000A;
+			buildPhases = (
+				1ABE11E00000000000000007,
+				1ABE11E00000000000000008,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Flying_Platform;
+			productName = Flying_Platform;
+			productReference = 1ABE11E00000000000000005;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1ABE11E00000000000000001 = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = 1ABE11E00000000000000009;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 1ABE11E00000000000000002;
+			productRefGroup = 1ABE11E00000000000000004;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1ABE11E00000000000000006,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		1ABE11E00000000000000008 = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1ABE11E00000000000000101,
+				1ABE11E00000000000000103,
+				1ABE11E00000000000000105,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		1ABE11E0000000000000000B = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		1ABE11E0000000000000000C = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+		1ABE11E0000000000000000D = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 7;
+				DEVELOPMENT_TEAM = ABCDE12345;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Flying_Platform/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.labelle.flying-platform";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		1ABE11E0000000000000000E = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 7;
+				DEVELOPMENT_TEAM = ABCDE12345;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Flying_Platform/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.labelle.flying-platform";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1ABE11E00000000000000009 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1ABE11E0000000000000000B,
+				1ABE11E0000000000000000C,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		1ABE11E0000000000000000A = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1ABE11E0000000000000000D,
+				1ABE11E0000000000000000E,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 1ABE11E00000000000000001;
+}

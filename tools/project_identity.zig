@@ -32,6 +32,37 @@ pub fn load(a: std.mem.Allocator, io: std.Io, project_dir: []const u8) !Identity
     return parse(a, bytes);
 }
 
+/// The project's `.backend` (`.backend = .sokol` gives `sokol`), read by a
+/// lenient scan: backends are open-ended names, so no enum can type them.
+/// Null when the key is absent or not an enum literal.
+pub fn backend(source: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, source, i, ".backend")) |at| {
+        i = at + ".backend".len;
+        // `.backend_package` and friends are other keys.
+        if (i < source.len and (std.ascii.isAlphanumeric(source[i]) or source[i] == '_')) continue;
+        var j = i;
+        while (j < source.len and (source[j] == ' ' or source[j] == '\t')) j += 1;
+        if (j >= source.len or source[j] != '=') continue;
+        j += 1;
+        while (j < source.len and (source[j] == ' ' or source[j] == '\t')) j += 1;
+        if (j >= source.len or source[j] != '.') return null;
+        j += 1;
+        const start = j;
+        while (j < source.len and (std.ascii.isAlphanumeric(source[j]) or source[j] == '_')) j += 1;
+        return if (j > start) source[start..j] else null;
+    }
+    return null;
+}
+
+test "backend: the enum literal of .backend, never .backend_package" {
+    try std.testing.expectEqualStrings("sokol", backend(".{ .name = \"x\", .backend = .sokol, .backend_package = .{} }").?);
+    try std.testing.expectEqualStrings("raylib", backend(".{ .backend_package = .{ .name = \"s\" },\n    .backend=.raylib,\n}").?);
+    try std.testing.expect(backend(".{ .name = \"x\" }") == null);
+    try std.testing.expect(backend(".{ .backend_package = .{} }") == null);
+    try std.testing.expect(backend(".{ .backend = \"sokol\" }") == null);
+}
+
 test "reads identity and ignores every other project key" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

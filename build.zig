@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
     b.step("install-provider", "Install the labelle-cli provider tool (bin/labelle-ios)")
         .dependOn(&b.addInstallArtifact(provider, .{}).step);
     const provider_tests = b.addRunArtifact(b.addTest(.{ .root_module = provider_module }));
-    b.step("test-provider", "Run the provider host-tool tests (wire contract, settings, plist, simctl, zip)")
+    b.step("test-provider", "Run the provider host-tool tests (wire contract, settings, signing, plist, simctl, devicectl, doctor, xcode, zip)")
         .dependOn(&provider_tests.step);
     test_step.dependOn(&provider_tests.step);
 }

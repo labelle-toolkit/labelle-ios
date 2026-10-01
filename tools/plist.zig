@@ -25,7 +25,17 @@ pub const Info = struct {
     icon: ?[]const u8 = null,
     /// `CFBundleVersion`: `labelle bundle --build-number`, else 1.
     version: u32 = 1,
+    /// `CFBundleSupportedPlatforms`: `iPhoneSimulator` or `iPhoneOS`.
+    destination: settings_mod.Destination = .simulator,
 };
+
+/// The `CFBundleSupportedPlatforms` entry of a destination.
+pub fn platformName(d: settings_mod.Destination) []const u8 {
+    return switch (d) {
+        .simulator => "iPhoneSimulator",
+        .device => "iPhoneOS",
+    };
+}
 
 /// The complete `Info.plist` document. Caller owns the result.
 pub fn infoPlist(a: std.mem.Allocator, info: Info) ![]u8 {
@@ -53,7 +63,7 @@ pub fn infoPlist(a: std.mem.Allocator, info: Info) ![]u8 {
     try string(w, "CFBundleName", info.app_name);
     try string(w, "CFBundlePackageType", "APPL");
     try string(w, "CFBundleShortVersionString", "1.0");
-    try w.writeAll("    <key>CFBundleSupportedPlatforms</key>\n    <array>\n        <string>iPhoneSimulator</string>\n    </array>\n");
+    try w.print("    <key>CFBundleSupportedPlatforms</key>\n    <array>\n        <string>{s}</string>\n    </array>\n", .{platformName(info.destination)});
     try w.print("    <key>CFBundleVersion</key>\n    <string>{d}</string>\n", .{info.version});
     try boolean(w, "LSRequiresIPhoneOS", true);
     try string(w, "MinimumOSVersion", info.minimum_ios);
@@ -213,6 +223,19 @@ test "text is XML-escaped" {
     defer a.free(plist);
     try expectContains(plist, "<string>Cats &amp; &lt;Dogs&gt;</string>");
     try std.testing.expect(std.mem.indexOf(u8, plist, "Cats & ") == null);
+}
+
+test "a device build declares iPhoneOS, a simulator build iPhoneSimulator" {
+    const a = std.testing.allocator;
+    const sim = try infoPlist(a, base);
+    defer a.free(sim);
+    try expectContains(sim, "<key>CFBundleSupportedPlatforms</key>\n    <array>\n        <string>iPhoneSimulator</string>");
+    var dev_info = base;
+    dev_info.destination = .device;
+    const dev = try infoPlist(a, dev_info);
+    defer a.free(dev);
+    try expectContains(dev, "<key>CFBundleSupportedPlatforms</key>\n    <array>\n        <string>iPhoneOS</string>");
+    try std.testing.expect(std.mem.indexOf(u8, dev, "iPhoneSimulator") == null);
 }
 
 test "CFBundleVersion is the build number" {

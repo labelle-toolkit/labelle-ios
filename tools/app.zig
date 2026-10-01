@@ -1,5 +1,5 @@
 //! The `app` hook (after `build`): wrap the core build's executable into a
-//! simulator `.app` (ported from labelle-cli `src/cli/ios.zig`
+//! simulator or device `.app` (ported from labelle-cli `src/cli/ios.zig`
 //! `deployToSimulator`, origin/main e2e0e85, which did it at launch time).
 //!
 //! Layout, under the generated target directory `.labelle/<backend>_ios/`:
@@ -18,6 +18,11 @@
 //! to `zig-out/ios/` in one step, so the app and its record appear together
 //! or not at all: a failure leaves no `.app`, and an older one is never
 //! presented as this build's.
+//!
+//! `destination` (providers/ios.json) decides the flavour: a simulator app
+//! is ad-hoc signed; a device app (built with `-Ddevice=true` by the `device`
+//! hook) embeds the provisioning profile and is signed with the project's
+//! identity (`signing.zig`).
 const std = @import("std");
 const builtin = @import("builtin");
 const settings_mod = @import("settings.zig");
@@ -25,6 +30,7 @@ const identity_mod = @import("project_identity.zig");
 const plist = @import("plist.zig");
 const proc = @import("proc.zig");
 const assets_mod = @import("assets.zig");
+const signing = @import("signing.zig");
 
 pub const Inputs = struct {
     project_dir: []const u8,
@@ -39,9 +45,13 @@ pub const Inputs = struct {
     build_number: ?[]const u8 = null,
     /// The environment tools (`codesign`) are looked up in.
     env: *const std.process.Environ.Map,
-    /// Ad-hoc sign the bundle: on a macOS host, the only one with
-    /// `codesign` and the only one that can run the simulator.
+    /// Sign the bundle (ad hoc for the simulator, with the identity for a
+    /// device): on a macOS host, the only one with `codesign` and the only
+    /// one that can run the simulator.
     sign: bool = builtin.os.tag == .macos,
+    /// Whether this host can make a device app at all (a device refuses an
+    /// unsigned one). Test seam.
+    host_macos: bool = builtin.os.tag == .macos,
     /// Test seam: make writing `app.json` fail, as a full disk would.
     fail_record_write: bool = false,
 };
@@ -53,7 +63,7 @@ pub const icon_base = "AppIcon60x60";
 /// it to find the app and to refuse one that is no longer what this build
 /// and these settings would make (`built`).
 pub const Record = struct {
-    schema: u32 = 2,
+    schema: u32 = 3,
     /// `<AppName>.app`, relative to `zig-out/ios/`.
     app: []const u8,
     bundle_id: []const u8,
@@ -65,13 +75,15 @@ pub const Record = struct {
     /// `CFBundleVersion`.
     version: u32,
     signed: bool,
+    /// What the app was made for: `simulator` or `device` (schema 3).
+    destination: settings_mod.Destination,
 };
 
 pub const Built = struct { path: []const u8, record: Record };
 
 /// `CFBundleVersion` from `--build-number`: a positive integer (absent
 /// means 1). App Store Connect takes up to three period-separated integers;
-/// v0.1 keeps the one the CLI and the Android provider share.
+/// the provider keeps the one the CLI and the Android provider share.
 pub fn bundleVersion(build_number: ?[]const u8) !u32 {
     const text = build_number orelse return 1;
     const value = std.fmt.parseInt(u32, text, 10) catch 0;
@@ -107,7 +119,8 @@ fn iconPath(a: std.mem.Allocator, in: Inputs) !?[]const u8 {
 
 /// A digest of every input besides the executable that shapes the bundle:
 /// the settings file byte for byte, the resolved app name (the project title
-/// when `app_name` is absent) and the icon's path and bytes. The build
+/// when `app_name` is absent), the icon's path and bytes and, for a device
+/// build, the provisioning profile's bytes. The build
 /// number is left out: it stamps a bundle, it does not make an app stale.
 pub fn inputsDigest(a: std.mem.Allocator, io: std.Io, in: Inputs) ![]const u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -132,6 +145,12 @@ pub fn inputsDigest(a: std.mem.Allocator, io: std.Io, in: Inputs) ![]const u8 {
         };
         part(&h, "icon", bytes);
     }
+    if (in.settings.destination == .device) if (in.settings.signing.profile) |rel| {
+        const path = try signing.profilePath(a, in.project_dir, rel);
+        // A missing profile is reported by the signing step with its fix.
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 * 1024 * 1024)) catch "";
+        part(&h, "profile", bytes);
+    };
     // Every shipped asset by path, size and content, through the same walk
     // the copy uses.
     const Digest = struct {
@@ -274,6 +293,11 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
     // First, so any refusal below leaves no app of an older build.
     const ios_dir = try iosDir(a, in.target_dir);
     try cwd.deleteTree(io, ios_dir);
+    const destination = in.settings.destination;
+    if (destination == .device and !in.host_macos) {
+        std.debug.print("labelle-ios: a device app must be signed, and signing needs macOS with Xcode\n", .{});
+        return error.DeviceBuildNeedsMacos;
+    }
     const bin_dir = try std.fs.path.join(a, &.{ in.target_dir, "zig-out", "bin" });
     const exe = try singleExecutable(try listExecutables(a, io, bin_dir), bin_dir);
     const version = try bundleVersion(in.build_number);
@@ -305,7 +329,7 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
         }
         // Copied as-is under the names `CFBundleIconFiles` resolves: the
         // home screen scales it. Sized renditions and an asset catalog
-        // (actool) come with device builds (v0.2).
+        // (actool) are on the roadmap.
         for ([_][]const u8{ "@2x", "@3x" }) |scale| {
             const name = try std.fmt.allocPrint(a, "{s}{s}.png", .{ icon_base, scale });
             try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ staged, name }), .data = png });
@@ -322,6 +346,7 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
         .device_family = in.settings.device_family,
         .icon = icon,
         .version = version,
+        .destination = destination,
     });
     try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ staged, "Info.plist" }), .data = info });
     try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ staged, "PkgInfo" }), .data = "APPL????" });
@@ -348,9 +373,24 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
     var copier: Copy = .{ .io = io, .a = a, .dst = try std.fs.path.join(a, &.{ staged, "assets" }) };
     try walkAssets(a, io, in, &copier);
 
-    const signed = if (in.sign) try adHocSign(a, io, in.env, staged) else blk: {
+    const signed = if (!in.sign) blk: {
         std.debug.print("labelle-ios: note: {s} is not signed: codesign needs a macOS host\n", .{bundle_name});
         break :blk false;
+    } else switch (destination) {
+        .simulator => try adHocSign(a, io, in.env, staged),
+        .device => blk: {
+            // Beside the staging root, so nothing of it lands in zig-out/ios.
+            const scratch = try std.fmt.allocPrint(a, "{s}-signing", .{staging_root});
+            defer cwd.deleteTree(io, scratch) catch {};
+            try signing.signDevice(a, io, .{
+                .app = staged,
+                .scratch = scratch,
+                .project_dir = in.project_dir,
+                .settings = in.settings,
+                .env = in.env,
+            });
+            break :blk true;
+        },
     };
 
     const record: Record = .{
@@ -361,6 +401,7 @@ pub fn make(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
         .inputs_sha256 = inputs_sha256,
         .version = version,
         .signed = signed,
+        .destination = destination,
     };
     const json = try std.json.Stringify.valueAlloc(a, record, .{ .whitespace = .indent_2 });
     // The record is staged next to the app (outside it: the signature seals
@@ -430,7 +471,64 @@ pub fn built(a: std.mem.Allocator, io: std.Io, in: Inputs) !Built {
     return .{ .path = path, .record = record };
 }
 
+/// The iOS target directories (`.labelle/<backend>_ios/`) of a project
+/// that hold a made app (`zig-out/ios/app.json`), sorted: what `labelle ios
+/// run` and `labelle ios xcode` act on.
+pub fn builtTargets(a: std.mem.Allocator, io: std.Io, project_dir: []const u8) ![]const []const u8 {
+    const labelle_dir = try std.fs.path.join(a, &.{ project_dir, ".labelle" });
+    var found: std.ArrayList([]const u8) = .empty;
+    var dir = std.Io.Dir.cwd().openDir(io, labelle_dir, .{ .iterate = true }) catch return found.items;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, "_ios")) continue;
+        const target_dir = try std.fs.path.join(a, &.{ labelle_dir, entry.name });
+        const record = try std.fs.path.join(a, &.{ target_dir, "zig-out", "ios", record_name });
+        std.Io.Dir.cwd().access(io, record, .{}) catch continue;
+        try found.append(a, target_dir);
+    }
+    std.mem.sort([]const u8, found.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
+    return found.items;
+}
+
+/// Exactly one built target, or an actionable refusal.
+pub fn singleBuiltTarget(targets: []const []const u8) ![]const u8 {
+    if (targets.len == 1) return targets[0];
+    if (targets.len == 0) {
+        std.debug.print("labelle-ios: no built iOS app in this project: run `labelle build --platform=ios` first\n", .{});
+        return error.NoBuiltApp;
+    }
+    std.debug.print("labelle-ios: several iOS builds in this project (one per backend); remove the ones you do not use:\n", .{});
+    for (targets) |t| std.debug.print("  {s}\n", .{t});
+    return error.AmbiguousBuild;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
+
+test "builtTargets: the .labelle/*_ios dirs that hold a made app" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try std.testing.expectEqual(@as(usize, 0), (try builtTargets(a, io, root)).len);
+    try tmp.dir.createDirPath(io, ".labelle/sokol_ios/zig-out/ios");
+    try tmp.dir.createDirPath(io, ".labelle/sokol_android/zig-out/ios");
+    try tmp.dir.createDirPath(io, ".labelle/bgfx_ios/zig-out");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/sokol_ios/zig-out/ios/app.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".labelle/sokol_android/zig-out/ios/app.json", .data = "{}" });
+    const found = try builtTargets(a, io, root);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqualStrings("sokol_ios", std.fs.path.basename(try singleBuiltTarget(found)));
+    try std.testing.expectError(error.NoBuiltApp, singleBuiltTarget(&.{}));
+    try std.testing.expectError(error.AmbiguousBuild, singleBuiltTarget(&.{ "a", "b" }));
+}
 
 test "singleExecutable: one wins; none and several are refused" {
     try std.testing.expectEqualStrings("game", try singleExecutable(&.{"game"}, "/b"));
@@ -774,4 +872,51 @@ test "an unreadable icon fails with its real error, never as a stale app" {
     if (inputsDigest(a, io, in)) |_| return error.TestUnexpectedResult else |err| {
         if (builtin.os.tag != .windows) try std.testing.expectEqual(error.IsDir, err);
     }
+}
+
+const device_settings =
+    \\{"schema_version": 1, "bundle_id": "com.labelle.test", "destination": "device",
+    \\ "signing": {"identity": "Apple Development: Jo", "profile": "dev.mobileprovision"}}
+;
+
+test "make: a device app declares iPhoneOS, embeds the profile and is signed with the identity" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // shell fakes
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try Fixture.init(a);
+    defer f.tmp.cleanup();
+    var fake = try signing.FakeTools.init(a, io, f.tmp.dir, .{ .app_id = "ABCDE12345.*", .keychain_group = "ABCDE12345.*" });
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "dev.mobileprovision", .data = "PROFILE" });
+    var in = try f.inputs(a, device_settings);
+    in.env = &fake.env;
+    in.sign = true;
+    in.host_macos = true;
+    const app = try make(a, io, in);
+    try std.testing.expectEqual(settings_mod.Destination.device, app.record.destination);
+    try std.testing.expect(app.record.signed);
+    const info = try f.tmp.dir.readFileAlloc(io, "target/zig-out/ios/My_Game.app/Info.plist", a, .limited(1 << 16));
+    try std.testing.expect(std.mem.indexOf(u8, info, "<string>iPhoneOS</string>") != null);
+    try std.testing.expectEqualStrings("PROFILE", try f.tmp.dir.readFileAlloc(io, "target/zig-out/ios/My_Game.app/embedded.mobileprovision", a, .limited(64)));
+    // Never the ad-hoc signature, and nothing of the signing scratch left.
+    const log = try fake.log(a, io);
+    try std.testing.expect(std.mem.indexOf(u8, log, "--sign Apple Development: Jo --entitlements") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "--sign -") == null);
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "target/zig-out/ios/entitlements.plist", .{}));
+    _ = try built(a, io, in);
+    // A new profile makes the app stale.
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "dev.mobileprovision", .data = "RENEWED" });
+    try std.testing.expectError(error.StaleApp, built(a, io, in));
+}
+
+test "make: a device app on a host that cannot sign is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try Fixture.init(a);
+    defer f.tmp.cleanup();
+    var in = try f.inputs(a, device_settings);
+    in.host_macos = false;
+    try std.testing.expectError(error.DeviceBuildNeedsMacos, make(a, std.testing.io, in));
 }
